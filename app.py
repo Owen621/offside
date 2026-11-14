@@ -424,9 +424,7 @@ def html_buttons(html, home="", away="", info=None, rows_hint=None):
     seen = before[-1] if before else (after[0] if after else (wins[0][1] if wins else None))
     hinted = [kind(x) for x in (rows_hint or [])][:3]
     html_order, hint_order = (perm(seen) if seen else None), perm(hinted) if len(hinted) == 3 else None
-    if html_order and hint_order and html_order != hint_order:
-        info["rows"] = "the page's row names (%s) and the extraction's (%s) disagree: not used" % (", ".join(seen), ", ".join(hinted)); return {}
-    order = html_order or hint_order
+    order = html_order or hint_order                               # the page's own names win; the model's are a fallback
     if not order:
         info["rows"] = "could not tell which row is home, draw and away: not used"; return {}
     info["rows"] = "rows top to bottom: " + ", ".join(seen or hinted) + (" (from the page)" if html_order else " (from the extraction)")
@@ -848,7 +846,8 @@ def discover(key, leagues, days=3, limit=25, ask=None, search=None, read=None, n
 # --------------------------------------------------------------------------- the engine
 class Engine:
     def __init__(self, odds_key=None, ctx_key=None, interval=600, regions="uk,eu", horizon_h=72, now_fn=time.time,
-                 odds_fn=None, scores_fn=None, scrape_fn=None, result_fn=None, news_fn=None, verify_fn=None, shot_fn=None, persist=True):
+                 odds_fn=None, scores_fn=None, scrape_fn=None, result_fn=None, news_fn=None, verify_fn=None, shot_fn=None, persist=True,
+                 in_play=False):
         self.odds_key, self.ctx_key, self.interval, self.regions = odds_key, ctx_key, interval, regions
         self.horizon, self.now, self.persist = horizon_h * 3600, now_fn, persist
         self.odds_fn = odds_fn or (lambda lg: api_get("/sports/%s/odds" % lg, {"regions": self.regions, "markets": "h2h",
@@ -870,10 +869,46 @@ class Engine:
         self.pending, self.live, self.matches = {}, [], []
         self.last_good, self.unread = {}, set()
         self.read_at, self.league_cache, self.reads = {}, {}, 0
+        self.in_play, self.failed, self.hist, self.last_real_read = in_play, set(), {}, None
+        self.stats = {"pages": 0, "prices": 0, "screenshots": 0, "news": 0, "since": self.now()}
+        self.missed = []
+        if persist: self._restore()
         self.sources, self.quota, self.last_read, self.score_checked = {}, None, None, {}
 
     def _save(self, name, obj):
         if self.persist: save(name, obj)
+
+    def _restore(self):
+        """Pick up where the last run stopped: the last prices read, flags waiting for their second read, counters."""
+        st = load("state.json", {})
+        self.stats = dict(self.stats, **(st.get("stats") or {}))
+        self.missed = st.get("missed") or []
+        self.hist = st.get("hist") or {}
+        for url, g in (st.get("last_good") or {}).items():
+            m = g.get("m") or {}
+            m["books"] = {k: tuple(v) for k, v in (m.get("books") or {}).items()}
+            m.setdefault("proof", ""); m.setdefault("links", {})
+            self.last_good[url] = {"t": g.get("t", 0), "m": m}
+        for row in st.get("pending") or []:
+            k = tuple(row["key"])
+            if row.get("recorded") or self.now() - row.get("first_seen", 0) < 20 * 60:
+                self.pending[k] = {x: row[x] for x in row if x != "key"}
+        rows = []
+        for url, g in self.last_good.items():                      # show the last known prices straight away
+            m = g["m"]
+            if m.get("kickoff") and m["kickoff"] < self.now(): continue
+            res = scan.analyse(m["books"])
+            rows.append({"id": m["id"], "home": m["home"], "away": m["away"], "kickoff": m["kickoff"], "scope": m["scope"],
+                         "league": m["league_title"], "books": len(m["books"]), "avg": res["avg"] if res else None,
+                         "nearest": nearest(m["books"]), "flags": len(res["flags"]) if res else 0, "stale": g["t"]})
+        self.matches = sorted(rows, key=lambda s: (s["kickoff"] or 9e18))
+        if rows: self.last_read = max(g["t"] for g in self.last_good.values())
+
+    def _remember(self):
+        if not self.persist: return
+        save("state.json", {"stats": self.stats, "missed": self.missed[-200:], "hist": self.hist,
+                            "pending": [dict(v, key=list(k)) for k, v in self.pending.items()],
+                            "last_good": {u: {"t": g["t"], "m": {x: g["m"][x] for x in g["m"] if x != "proof"}} for u, g in self.last_good.items()}})
 
     def _verify(self, link, price):
         """Open the bookmaker's own page through Context.dev and look for the price."""
@@ -913,8 +948,14 @@ class Engine:
             self.watch.append({"url": url, "home": home, "away": away, "kickoff": kickoff_ts or parse_kickoff(kickoff), "scope": scope})
             self._save("watch.json", self.watch); return True
 
-    def cadence(self, kickoff):
-        """Seconds between reads of one match: the base pace in the last 3 hours, slower when kick-off is far off."""
+    def cadence(self, kickoff, url=None):
+        """Seconds between reads of one match: the base pace in the last 3 hours, slower when kick-off is far off.
+        A page with a flag waiting for its second sighting is read again after about a minute, so a price that is
+        really there gets confirmed before it moves."""
+        if url and (url in self.failed or any(k[0] == "page:" + url and not v.get("recorded") for k, v in self.pending.items())):
+            return min(self.interval, 60)                          # a failed read, or a flag to confirm: try again in a minute
+        if kickoff and self.now() > kickoff:
+            return min(self.interval, 120)                         # in play (only when in-play reading is switched on)
         if not kickoff: return self.interval
         left = kickoff - self.now()
         return max(self.interval, 3600) if left > 86400 else (max(self.interval, 1200) if left > 3 * 3600 else self.interval)
@@ -950,9 +991,9 @@ class Engine:
                 self.sources[lg["key"]] = {"t": self.now(), "matches": 0, "error": str(e)[:160]}
         due = []
         for w in list(self.watch):
-            if w.get("kickoff") and self.now() > w["kickoff"]:
+            if w.get("kickoff") and self.now() > w["kickoff"] + (115 * 60 if self.in_play else 0):
                 self.sources[w["url"]] = {"t": self.now(), "matches": 0, "error": "match has started"}; continue
-            if self.now() - self.read_at.get(w["url"], -1e18) >= self.cadence(w.get("kickoff")) - 1:
+            if self.now() - self.read_at.get(w["url"], -1e18) >= self.cadence(w.get("kickoff"), w["url"]) - 1:
                 due.append(w)
             else:                                                   # not due yet: keep showing the last read
                 self.unread.add("page:" + w["url"])
@@ -967,12 +1008,14 @@ class Engine:
         for w, (books, md, why, links, label) in zip(due, results):
             self.read_at[w["url"]] = self.now(); self.reads += 1
             if len(books) < scan.MIN_BOOKS:                         # this read failed: fall back to the last good one
+                self.failed.add(w["url"])
                 self.unread.add("page:" + w["url"])
                 self.sources[w["url"]] = {"t": self.now(), "matches": 0, "error": why or "only %d bookmaker prices could be read" % len(books)}
                 old = self.last_good.get(w["url"])
                 if old and self.now() - old["t"] < 3600:
                     out.append(dict(old["m"], stale=old["t"]))
                 continue
+            self.failed.discard(w["url"])
             if not w["home"]:
                 w["home"], w["away"] = teams_from_page(md)
             self.sources[w["url"]] = {"t": self.now(), "matches": 1, "error": None}
@@ -995,15 +1038,24 @@ class Engine:
                 if w.get("url") and w["url"] not in have: self.watch.append(w)
         keep_live = [e for e in self.live]
         already = {(r["mid"], r["book"], r["outcome"]) for r in self.record}
+        taken = {(r["mid"], r["outcome"]) for r in self.record}
         fresh_rows = []
         for m in self._gather():
             res = scan.analyse(m["books"]); near = nearest(m["books"])
+            playing = bool(m["kickoff"] and self.now() > m["kickoff"])
+            if res and not m.get("stale"):
+                h = self.hist.setdefault(m["id"], [])
+                h.append([round(self.now())] + [round(x, 3) for x in res["avg"]] + [round(x, 3) for x in res["best"]])
+                del h[:-60]
+            oi = {"home": 0, "draw": 1, "away": 2}.get((near or {}).get("outcome"), 0)
             summary.append({"id": m["id"], "home": m["home"], "away": m["away"], "kickoff": m["kickoff"], "scope": m["scope"],
                             "league": m["league_title"], "books": len(m["books"]), "avg": res["avg"] if res else None,
-                            "nearest": near, "flags": len(res["flags"]) if res else 0, "stale": m.get("stale")})
+                            "nearest": near, "flags": len(res["flags"]) if res else 0, "stale": m.get("stale"), "in_play": playing,
+                            "hist": [[x[0], x[1 + oi], x[4 + oi]] for x in self.hist.get(m["id"], [])]})
             if m.get("stale"):
                 live += [e for e in keep_live if e["mid"] == m["id"]]   # its flags stay on show until the next real read
                 continue                                           # old prices are never newly flagged or confirmed
+            self.stats["pages"] += 1; self.stats["prices"] += 3 * len(m["books"])
             fresh_rows.append({"t": round(self.now()), "match": "%s v %s" % (m["home"], m["away"]), "kickoff": m["kickoff"], "books": len(m["books"]),
                                "avg": res["avg"] if res else None, "best": res["best"] if res else None,
                                "flags": [[f["book"], f["outcome"], f["price"], f["points"]] for f in (res["flags"] if res else [])],
@@ -1011,13 +1063,15 @@ class Engine:
             for f in (res["flags"] if res else []):
                 k = (m["id"], f["book"], f["outcome"]); seen_now.add(k)
                 entry = dict(f, mid=m["id"], url=m["url"], league=m["league"], league_title=m["league_title"], home=m["home"],
-                             away=m["away"], kickoff=m["kickoff"], scope=m["scope"], link=(m.get("links") or {}).get(f["book"], ""))
+                             away=m["away"], kickoff=m["kickoff"], scope=m["scope"], link=(m.get("links") or {}).get(f["book"], ""),
+                             in_play=playing)
                 if k in already and k not in self.pending:
                     self.pending[k] = {"first_seen": self.now(), "recorded": True}
                 if k in self.pending:
                     entry["status"] = "confirmed"; entry["first_seen"] = self.pending[k]["first_seen"]
                     if not self.pending[k].get("recorded"):
-                        if k not in already:
+                        if k not in already and (m["id"], f["outcome"]) not in taken:
+                            taken.add((m["id"], f["outcome"]))
                             self._record(entry, m["proof"])
                             print("  %s  RECORDED: %s v %s, %s %s at %.2f (average %.2f)" % (time.strftime("%H:%M:%S"), m["home"], m["away"],
                                                                                            f["book"], f["outcome"], f["price"], f["average"]))
@@ -1025,10 +1079,12 @@ class Engine:
                     entry["news"] = self.pending[k].get("news", ""); entry["verify"] = self.pending[k].get("verify", "")
                 else:
                     entry["status"] = "checking"; entry["first_seen"] = self.now(); entry["news"] = ""; entry["verify"] = ""
-                    self.pending[k] = {"first_seen": self.now()}
+                    self.pending[k] = {"first_seen": self.now(), "match": "%s v %s" % (m["home"], m["away"]), "price": f["price"]}
                 live.append(entry)
         for k in [k for k in self.pending if k not in seen_now and k[0] not in self.unread]:
-            del self.pending[k]                                    # back in line (or kicked off) before confirmation
+            gone = self.pending.pop(k)                             # back in line (or kicked off) before confirmation
+            if not gone.get("recorded") and gone.get("match"):
+                self.missed.append({"t": self.now(), "match": gone["match"], "book": k[1], "outcome": k[2], "price": gone.get("price")})
         if self.persist and fresh_rows:
             try:
                 os.makedirs(DATA, exist_ok=True)
@@ -1040,7 +1096,9 @@ class Engine:
             self.live = sorted(live, key=lambda e: (e["kickoff"] or 9e18, -e["edge_pct"]))
             self.matches = sorted(summary, key=lambda s: (s["kickoff"] or 9e18))
             self.last_read = self.now()
+            if self.reads: self.last_real_read = self.now()
         self.settle()
+        self._remember()
 
     def _record(self, entry, proof_text):
         rid = hashlib.sha1(("%s|%s|%s|%s" % (entry["mid"], entry["book"], entry["outcome"], entry["first_seen"])).encode()).hexdigest()[:10]
@@ -1071,18 +1129,51 @@ class Engine:
                "url": entry["url"], "home": entry["home"], "away": entry["away"], "kickoff": entry["kickoff"], "scope": entry["scope"],
                "book": entry["book"], "outcome": entry["outcome"], "price": entry["price"], "average": entry["average"],
                "needed": entry["needed"], "points": entry["points"], "edge_pct": entry["edge_pct"], "proof": proof, "shot": shot,
-               "verify": verify, "link": entry.get("link") or entry["url"],
+               "verify": verify, "link": entry.get("link") or entry["url"], "in_play": bool(entry.get("in_play")),
                "news": "", "news_url": "", "result": None, "score": "", "profit": None, "checked": 0}
+        if shot: self.stats["screenshots"] += 1
         if entry["home"]:
-            try: rec["news"], rec["news_url"] = self.news(rec)
+            try:
+                rec["news"], rec["news_url"] = self.news(rec); self.stats["news"] += 1
             except Exception: pass
         self.pending[(entry["mid"], entry["book"], entry["outcome"])]["news"] = rec["news"]
         self.pending[(entry["mid"], entry["book"], entry["outcome"])]["verify"] = verify
         with self.lock:
             self.record.append(rec); self._save("record.json", self.record)
 
+    def _closing(self):
+        """For each recorded price whose match has kicked off, store the average price at the last read before
+        kick-off. Price / closing average - 1 is the fairest quick measure of whether the flag was good."""
+        idx = {"home": 0, "draw": 1, "away": 2}
+        todo = [r for r in self.record if r.get("close_avg") is None and r.get("kickoff") and self.now() > r["kickoff"]]
+        if not todo: return
+        log = {}
+        try:
+            with open(os.path.join(DATA, "reads.jsonl"), encoding="utf-8") as f:
+                for line in f:
+                    row = json.loads(line)
+                    if row.get("avg") and row.get("kickoff") and row["t"] <= row["kickoff"]:
+                        log[row["match"]] = row                    # later lines overwrite: the last read before kick-off
+        except Exception:
+            pass
+        changed = False
+        for r in todo:
+            g = self.last_good.get(r.get("url") or "")
+            avg, t = None, None
+            if g and g["m"].get("books") and g["t"] <= r["kickoff"] and not self.in_play:
+                bk = g["m"]["books"]; avg = sum(v[idx[r["outcome"]]] for v in bk.values()) / len(bk); t = g["t"]
+            row = log.get("%s v %s" % (r["home"], r["away"]))
+            if row and (t is None or row["t"] > t):
+                avg, t = row["avg"][idx[r["outcome"]]], row["t"]
+            r["close_avg"] = round(avg, 3) if avg else 0              # 0 = no closing read available
+            r["close_t"] = t; changed = True
+        if changed:
+            with self.lock: self._save("record.json", self.record)
+
     # ----- settle finished matches
     def settle(self):
+        try: self._closing()
+        except Exception: pass
         due = [r for r in self.record if r["result"] is None and r["home"] and
                self.now() >= ((r["kickoff"] + 135 * 60) if r["kickoff"] else r["t"] + 4 * 3600)]
         if not due:
@@ -1122,7 +1213,12 @@ class Engine:
         with self.lock:
             settled = [r for r in self.record if r["result"] is not None]
             profit = sum(r["profit"] for r in settled)
-            return {"now": self.now(), "interval": self.interval, "last_read": self.last_read, "quota": self.quota,
+            closed = [r for r in self.record if r.get("close_avg")]
+            return {"now": self.now(), "interval": self.interval, "last_read": self.last_real_read or self.last_read, "quota": self.quota,
+                    "in_play_mode": self.in_play,
+                    "stats": self.stats, "missed": len(self.missed),
+                    "closing": {"n": len(closed), "beat": sum(1 for r in closed if r["price"] > r["close_avg"]),
+                                "edge": (sum(r["price"] / r["close_avg"] - 1 for r in closed) / len(closed)) if closed else None},
                     "has_odds_key": bool(self.odds_key), "has_ctx_key": bool(self.ctx_key),
                     "leagues": [dict(l, source=self.sources.get(l["key"], {})) for l in self.leagues],
                     "pages": [dict(w, source=self.sources.get(w["url"], {})) for w in self.watch],
@@ -1252,6 +1348,11 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid var(-
 .figs span{display:block;font-size:.8rem;color:var(--muted);line-height:1.3;margin-top:2px}
 .figs b{font-family:Bahnschrift,"DIN Alternate","Arial Narrow",Arial,sans-serif;font-size:2.1rem;font-weight:600;font-variant-numeric:tabular-nums;line-height:1}
 svg{display:block;width:100%;height:auto}
+.work{display:flex;flex-wrap:wrap;gap:10px 34px;margin-top:14px;padding:16px 20px;background:var(--panel);border:1px solid var(--line);border-radius:4px}
+.work b{font-family:Bahnschrift,"DIN Alternate","Arial Narrow",Arial,sans-serif;font-size:1.5rem;font-weight:600;font-variant-numeric:tabular-nums;display:block;line-height:1.1}
+.work span{font-size:.8rem;color:var(--muted)}
+.spark{display:block;width:150px;height:34px}
+.thumb{display:block;width:92px;height:58px;object-fit:cover;object-position:top;border:1px solid var(--line);border-radius:3px}
 .key{display:flex;flex-wrap:wrap;gap:6px 24px;font-size:.85rem;color:var(--muted);margin-top:10px}
 .key i{display:inline-block;width:24px;height:3px;vertical-align:middle;margin-right:7px}
 ol,ul{padding-left:20px;margin:8px 0}li{margin:7px 0;max-width:68ch}
@@ -1264,8 +1365,9 @@ footer{margin-top:48px;font-size:.8rem;color:var(--muted);border-top:1px solid v
 <main class="in">
 <section aria-labelledby="h-live"><h2 id="h-live">Out of line right now</h2>
 <p class="sub">Each row is one bookmaker paying clearly more than the average of all the others for the same result.
-A price is recorded only once it is still there on the next read.</p>
-<div class="scroll" id="live"></div></section>
+To act on a row you would back that result at that bookmaker yourself, at that price. Offside reads the page again about a minute later and records the price, as one unit staked, only if it is still there.</p>
+<div class="scroll" id="live"></div>
+<div class="work" id="work" style="display:none" aria-label="What Context.dev has done since switch-on"></div></section>
 
 <section aria-labelledby="h-all"><h2 id="h-all">Every match being watched</h2>
 <p class="sub" id="allsub"></p><div class="scroll" id="all"></div>
@@ -1312,7 +1414,7 @@ function until(k,now){ if(!k) return "time not given"; const d=k-now; if(d<=0) r
   return h>=48? "in "+Math.floor(h/24)+" days" : h>0? "in "+h+" h "+m+" min" : "in "+Math.max(1,m)+" min"; }
 const names={home:"Home win",draw:"Draw",away:"Away win"};
 const matchName=e=> e.home? esc(e.home)+" v "+esc(e.away) : "<span class='small'>teams not read from the page</span>";
-const scope=e=> e.scope==="tested"? "" : " <span class='tag'>outside the tested leagues</span>";
+const scope=e=> (e.scope==="tested"? "" : " <span class='tag'>outside the tested leagues</span>")+(e.in_play&&e.book? " <span class='tag'>in play, not covered by the test</span>":"");
 const plural=(n,w)=>n+" "+w+(n===1?"":(w.endsWith("ch")?"es":"s"));
 function checked(v){ return v==="seen"? "<span class='tag ok'>seen on the bookmaker's page</span>" :
   v==="not shown"? "<span class='tag'>not found on the bookmaker's page</span>" :
@@ -1323,7 +1425,7 @@ function renderStatus(){
   const nL=S.leagues.length, nP=S.pages.length, bad=S.leagues.concat(S.pages).filter(x=>x.source&&x.source.error&&x.source.error!=="match has started");
   let h="<span class='dot"+(S.last_read?"":" off")+"'></span>";
   h+= S.last_read? "<b>"+plural(nP+ (nL? S.matches.length:0),"match")+"</b> watched"+
-      (S.matches.length<nP? " ("+S.matches.length+" of "+nP+" read so far)":"")+"<br>Last check at <b>"+esc(clock(S.last_read))+"</b>. Each match is read every "+(Math.round(S.interval/6)/10)+" min in its last 3 hours" : "First read in progress";
+      (S.matches.length<nP? " ("+S.matches.length+" of "+nP+" read so far)":"")+"<br>Prices last read at <b>"+esc(clock(S.last_read))+"</b>. Every "+(Math.round(S.interval/6)/10)+" min in a match's last 3 hours, and again within a minute when a price is out of line"+(S.in_play_mode?"<br>In-play reading is on":"") : "First read in progress";
   if(S.quota) h+="<br>Odds data credits left this month: <b>"+esc(S.quota.remaining)+"</b>";
   if(bad.length) h+="<br>"+plural(bad.length,"source")+" could not be read";
   if(!S.has_ctx_key) h+="<br>No Context.dev key set: page checks and news are off";
@@ -1340,12 +1442,12 @@ function renderLive(){
   for(const e of L){ const k=e.mid+"|"+e.book+"|"+e.outcome, fresh=!first&&!seen.has(k); seen.add(k);
     const ev=S.evidence&&S.evidence.settings&&S.evidence.settings[String(e.points)];
     h+="<tr"+(fresh?" class='fresh'":"")+"><td class='when'><span class='num'>"+esc(until(e.kickoff,S.now))+"</span><div class='small'>"+esc(day(e.kickoff))+"</div></td>"+
-    "<td class='m'><span class='match'>"+matchName(e)+"</span>"+scope(e)+"<div class='small'>"+esc(e.league_title)+"</div></td><td>"+names[e.outcome]+"</td><td class='nw'>"+esc(e.book)+"</td>"+
+    "<td class='m'><span class='match'>"+matchName(e)+"</span>"+scope(e)+"<div class='small'>"+(e.url? "<a href='"+esc(e.url)+"' target='_blank' rel='noopener'>open the odds page</a>" : esc(e.league_title))+"</div></td><td>"+names[e.outcome]+"</td><td class='nw'>"+esc(e.book)+"</td>"+
     "<td><span class='yc'>"+e.price.toFixed(2)+"</span></td>"+
     "<td><span class='num'>"+e.average.toFixed(2)+"</span><div class='small'>average. Rule needs above "+e.needed.toFixed(2)+"</div></td>"+
     "<td><span class='num pos'>+"+(100*(e.price/e.average-1)).toFixed(0)+"%</span> <span class='small nw'>above the average</span>"+
     "<div class='small'>passes the minus "+e.points+" setting"+(ev? " ("+(ev.roi>=0?"+":"")+(100*ev.roi).toFixed(0)+"% in the test)":"")+"</div></td>"+
-    "<td class='st'>"+(e.status==="confirmed"?"<span class='tag ok'>recorded</span>":"<span class='tag'>checking on next read</span>")+
+    "<td class='st'>"+(e.status==="confirmed"?"<span class='tag ok'>recorded</span>":"<span class='tag'>checking again in about a minute</span>")+
     (e.verify?"<div style='margin-top:5px'>"+checked(e.verify)+"</div>":"")+
     (e.news?"<div class='small' style='margin-top:5px'>"+esc(e.news)+"</div>":"")+"</td></tr>"; }
   $("live").innerHTML=h+"</tbody></table>"; first=false;
@@ -1355,15 +1457,25 @@ function renderAll(){
   $("allsub").textContent = M.length? "The bar shows how close the most generous price is to the line at the medium setting. A full bar means it is out of line." :
     (S.pages.length? plural(S.pages.length,"match")+" saved. Prices appear as each one is read." : "No matches are being watched yet.");
   if(!M.length && !extra){ $("all").innerHTML="<div class='setup small'>Nothing to show yet.</div>"; return; }
-  let h="<table><thead><tr><th>Kick-off</th><th>Match</th><th>Bookmakers</th><th>Average price: home, draw, away</th><th>Closest to the line</th></tr></thead><tbody>";
+  let h="<table><thead><tr><th>Kick-off</th><th>Match</th><th>Bookmakers</th><th>Average price: home, draw, away</th><th>Closest to the line</th><th>How it has moved</th></tr></thead><tbody>";
   for(const m of M){ const n=m.nearest; let c="<span class='small'>too few bookmakers to judge</span>";
     if(n){ const pct=Math.max(0,Math.min(1,(n.ratio-0.85)/0.15)); c="<div class='nw'><span class='meter"+(n.ratio>=1?" hot":"")+"'><i style='width:"+(100*pct).toFixed(0)+"%'></i></span>"+
       "<span class='num'>"+n.price.toFixed(2)+"</span> <span class='small'>needs above "+n.needed.toFixed(2)+"</span></div>"+
       "<div class='small'>"+esc(n.book)+", "+names[n.outcome].toLowerCase()+"</div>"; }
     h+="<tr><td class='when'><span class='num'>"+esc(until(m.kickoff,S.now))+"</span><div class='small'>"+esc(day(m.kickoff))+"</div></td>"+
-    "<td><span class='match'>"+matchName(m)+"</span>"+scope(m)+"<div class='small'>"+esc(m.league)+(m.stale? ", prices from "+esc(clock(m.stale)):"")+"</div></td><td><span class='num'>"+m.books+"</span></td>"+
-    "<td class='num nw'>"+(m.avg? m.avg.map(a=>a.toFixed(2)).join("&nbsp;&nbsp;&nbsp;"):"<span class='small'>n/a</span>")+"</td><td>"+c+"</td></tr>"; }
+    "<td><span class='match'>"+matchName(m)+"</span>"+scope(m)+(m.in_play?" <span class='tag'>in play</span>":"")+"<div class='small'>"+esc(m.league)+(m.stale? ", prices from "+esc(clock(m.stale)):"")+"</div></td><td><span class='num'>"+m.books+"</span></td>"+
+    "<td class='num nw'>"+(m.avg? m.avg.map(a=>a.toFixed(2)).join("&nbsp;&nbsp;&nbsp;"):"<span class='small'>n/a</span>")+"</td><td>"+c+"</td><td>"+spark(m.hist)+"</td></tr>"; }
   $("all").innerHTML=h+extra+"</tbody></table>";
+}
+function spark(h){
+  // the average price (grey) and the best price on offer (yellow) over the last reads, for the result nearest the line
+  if(!h || h.length<2) return "<span class='small'>builds up as it is read</span>";
+  const W=150,H=34,xs=h.map(p=>p[0]),vs=h.flatMap(p=>[p[1],p[2]]),x0=Math.min(...xs),x1=Math.max(...xs)+1,y0=Math.min(...vs),y1=Math.max(...vs);
+  const X=v=>2+(v-x0)/(x1-x0)*(W-4), Y=v=>H-3-(y1===y0?0.5:(v-y0)/(y1-y0))*(H-6);
+  const line=i=>h.map((p,j)=>(j?"L":"M")+X(p[0]).toFixed(1)+" "+Y(p[i]).toFixed(1)).join(" ");
+  return "<svg class='spark' viewBox='0 0 "+W+" "+H+"' role='img' aria-label='Average and best price over the last reads'>"+
+    "<path d='"+line(1)+"' fill='none' stroke='var(--chart2)' stroke-width='1.6'/><path d='"+line(2)+"' fill='none' stroke='var(--card)' stroke-width='2'/></svg>"+
+    "<div class='small'>"+h[0][1].toFixed(2)+" to "+h[h.length-1][1].toFixed(2)+" average</div>";
 }
 function waitingRows(){
   // watched matches that have no prices on the board yet: say so, and say why
@@ -1371,25 +1483,38 @@ function waitingRows(){
   for(const w of S.pages){ if(have.has("page:"+w.url)) continue;
     const src=w.source||{}, why = src.error? (src.error==="match has started"? "Kicked off. No longer read." : "Last read failed: "+src.error) : "Waiting for its first read.";
     h+="<tr><td class='when'><span class='num'>"+esc(until(w.kickoff,S.now))+"</span><div class='small'>"+esc(day(w.kickoff))+"</div></td>"+
-       "<td><span class='match'>"+matchName(w)+"</span>"+scope(w)+"</td><td colspan='3'><span class='small'>"+esc(why).slice(0,260)+"</span></td></tr>"; }
+       "<td><span class='match'>"+matchName(w)+"</span>"+scope(w)+"</td><td colspan='4'><span class='small'>"+esc(why).slice(0,260)+"</span></td></tr>"; }
   return h;
 }
 function renderRecord(){
-  const R=S.record, m=S.summary;
-  $("recsub").textContent = m.recorded===0? "Nothing recorded yet. Entries appear here once a flagged price is still there on a second read." :
-    plural(m.recorded,"price")+" recorded, "+m.settled+" settled, "+m.won+" won"+(m.settled? ". Return so far "+(m.roi>=0?"+":"")+(100*m.roi).toFixed(1)+
-    "% on one unit a bet. This is far too few bets to prove anything. It is shown so the record can be checked." : ". Results appear after each match ends.");
+  const R=S.record, m=S.summary, c=S.closing||{};
+  let t = m.recorded===0? "Nothing recorded yet. Entries appear here once a flagged price is still there on a second read." :
+    plural(m.recorded,"price")+" recorded, "+m.settled+" settled, "+m.won+" won. Each counts as one unit staked: a win pays the price minus one, a loss costs one."+
+    (m.settled? " Return so far "+(m.roi>=0?"+":"")+(100*m.roi).toFixed(1)+"% ("+(m.profit>=0?"+":"")+m.profit.toFixed(2)+" units). This is far too few bets to prove anything." : " Results appear after each match ends.");
+  if(c.n) t+=" Against the closing prices, "+c.beat+" of "+c.n+" recorded prices were still above the average at kick-off, by "+(100*c.edge).toFixed(1)+"% on average.";
+  if(S.missed) t+=" "+plural(S.missed,"other price")+" "+(S.missed===1?"was":"were")+" out of line on one read and gone by the next, so "+(S.missed===1?"it is":"they are")+" not counted.";
+  $("recsub").textContent=t;
   if(!R.length){ $("record").innerHTML="<div class='setup small'>The record is empty.</div>"; return; }
-  let h="<table><thead><tr><th>Recorded</th><th>Match</th><th>Result backed</th><th>Bookmaker</th><th>Price</th><th>Outcome</th><th>Profit</th><th>Proof</th></tr></thead><tbody>";
+  let h="<table><thead><tr><th>Recorded</th><th>Match</th><th>Bet</th><th>Price taken</th><th>At kick-off</th><th>Outcome</th><th>Profit</th><th>Proof</th></tr></thead><tbody>";
   for(const r of R){ const out = r.result==="won"? "<span class='won'>Won "+esc(r.score)+"</span>" : r.result==="lost"? "<span class='rc'>Lost "+esc(r.score)+"</span>" : "<span class='small'>not finished</span>";
+    const close = r.close_avg? "<span class='num'>"+r.close_avg.toFixed(2)+"</span><div class='small "+(r.price>r.close_avg?"pos":"neg")+"'>"+(r.price>r.close_avg?"still ":"")+((100*(r.price/r.close_avg-1))>=0?"+":"")+(100*(r.price/r.close_avg-1)).toFixed(0)+"% against the closing average</div>" :
+      (r.close_avg===0? "<span class='small'>no read before kick-off</span>" : "<span class='small'>not kicked off</span>");
     h+="<tr><td class='when'>"+esc(day(r.t))+"<div class='small'>"+(r.kickoff? "kick-off "+esc(day(r.kickoff)):"")+"</div></td><td class='m'><span class='match'>"+matchName(r)+"</span>"+scope(r)+
-    (r.verify?"<div style='margin-top:4px'>"+checked(r.verify)+"</div>":"")+
-    (r.news?"<div class='small' style='max-width:34ch;margin-top:4px'>"+esc(r.news)+"</div>":"")+"</td><td>"+names[r.outcome]+"</td><td>"+esc(r.book)+"</td>"+
-    "<td><span class='num'>"+r.price.toFixed(2)+"</span><div class='small'>average "+r.average.toFixed(2)+"</div></td><td>"+out+"</td>"+
+    (r.news?"<div class='small' style='max-width:34ch;margin-top:4px'>"+esc(r.news)+"</div>":"")+"</td>"+
+    "<td>"+names[r.outcome]+"<div class='small'>at "+esc(r.book)+"</div><div class='small'>passes minus "+r.points+"</div></td>"+
+    "<td><span class='num'>"+r.price.toFixed(2)+"</span><div class='small'>average then "+r.average.toFixed(2)+"</div></td><td>"+close+"</td><td>"+out+"</td>"+
     "<td><span class='num "+(r.profit>0?"pos":r.profit<0?"neg":"")+"'>"+(r.profit==null?"":(r.profit>0?"+":"")+r.profit.toFixed(2))+"</span></td>"+
-    "<td class='nw'>"+(r.shot? "<a href='/proof/"+esc(r.shot)+"' target='_blank' rel='noopener'>screenshot</a><br>":"")+
-    (r.proof? "<a href='/proof/"+esc(r.proof)+"' target='_blank' rel='noopener'>saved page</a>":"<span class='small'>none</span>")+"</td></tr>"; }
+    "<td>"+(r.shot? "<a href='/proof/"+esc(r.shot)+"' target='_blank' rel='noopener'><img class='thumb' src='/proof/"+esc(r.shot)+"' alt='Screenshot of the odds page when this price was recorded'></a>":"")+
+    (r.proof? "<a class='small' href='/proof/"+esc(r.proof)+"' target='_blank' rel='noopener'>saved page</a>":"<span class='small'>none</span>")+"</td></tr>"; }
   $("record").innerHTML=h+"</tbody></table>";
+}
+function renderWork(){
+  const s=S.stats||{}; if(!s.pages){ $("work").innerHTML=""; $("work").style.display="none"; return; }
+  $("work").style.display="";
+  const cell=(n,l)=>"<div><b>"+Number(n||0).toLocaleString()+"</b><span>"+l+"</span></div>";
+  $("work").innerHTML=cell(s.pages,"odds pages read through Context.dev")+cell(s.prices,"bookmaker prices read from them")+
+    cell(S.summary.recorded,"prices recorded")+cell(s.screenshots,"proof screenshots")+cell(s.news,"team-news searches")+
+    "<div><b>"+esc(day(s.since))+"</b><span>running since</span></div>";
 }
 function renderEvidence(){
   const E=S.evidence;
@@ -1430,7 +1555,7 @@ function drawChart(series, splitMonth, sp){
     "<path d='"+path(1)+"' fill='none' stroke='var(--win)' stroke-width='3' stroke-linejoin='round'/>"+
     "<text x='"+L+"' y='"+(T-8)+"' font-size='13' fill='var(--muted)'>Running profit in units, one unit staked per bet</text></svg>";
 }
-async function tick(){ try{ const r=await fetch("/api/state"); S=await r.json(); renderStatus(); renderLive(); renderAll(); renderRecord(); renderEvidence(); }
+async function tick(){ try{ const r=await fetch("/api/state"); S=await r.json(); renderStatus(); renderLive(); renderAll(); renderRecord(); renderWork(); renderEvidence(); }
   catch(e){ $("status").innerHTML="<span class='dot off'></span>The scanner is not answering. Is app.py still running?"; } }
 $("add").addEventListener("submit", async ev=>{ ev.preventDefault(); const u=$("url").value.trim(); if(!u) return;
   try{ const r=await fetch("/api/watch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:u})}); const j=await r.json();
@@ -1550,6 +1675,12 @@ def selftest():
     C.append(("after the match it is settled from the score feed with the right profit", r["result"] == "won" and abs(r["profit"] - 1.75) < 1e-9 and r["score"] == "2-0"))
     C.append(("settlement rules for all three results", settle_outcome("draw", 1, 1) and settle_outcome("away", 0, 2) and not settle_outcome("home", 0, 0)))
     st = e.state()
+    slow[0] = 2.75
+    e5 = Engine(interval=60, now_fn=lambda: clock[0], odds_fn=lambda lg: (events(), {}), scores_fn=lambda lg: [], news_fn=lambda rec: ("", ""),
+                verify_fn=lambda link, price: ("seen", ""), persist=False)
+    e5.add_league("soccer_england_league1"); e5.cycle(); slow[0] = 2.31; clock[0] += 60; e5.cycle()
+    two = page.replace("| 10Bet | 2.28 |", "| 10Bet | 2.80 |") if "page" in dir() else None
+    C.append(("a flag that vanished before confirmation is counted as seen-once, not as a bet", len(e5.missed) == 1 and e5.missed[0]["book"] == "SlowBook" and e5.record == []))
     C.append(("the dashboard data adds up and can be sent as JSON", st["summary"]["settled"] == 1 and st["summary"]["won"] == 1 and abs(st["summary"]["roi"] - 1.75) < 1e-9 and json.dumps(st)))
     page = ("# Gamma Town vs Delta City 1X2\n| bet365 | 2.30 | 3.40 | 3.00 |\n| William Hill | 2.25 | 3.30 | 3.10 |\n| Unibet | 2.35 | 3.45 | 2.95 |\n"
             "| Betfred | 2.30 | 3.40 | 3.00 |\n| 10Bet | 2.28 | 3.35 | 3.05 |\n| SlowBook | 2.75 | 3.30 | 2.90 |\n")
@@ -1566,6 +1697,19 @@ def selftest():
     clock[0] += 60; e3.cycle()
     C.append(("the flag is then confirmed on the next good read", len(e3.record) == 1))
     e2.add_watch("https://odds.example/m1"); e2.cycle(); clock[0] += 60; e2.cycle()
+    page2 = page.replace("| 10Bet | 2.28 |", "| 10Bet | 2.80 |")
+    e6 = Engine(interval=60, now_fn=lambda: clock[0], scrape_fn=lambda u: (page2, None), news_fn=lambda rec: ("", ""), persist=False)
+    e6.add_watch("https://odds.example/m6"); e6.cycle(); clock[0] += 60; e6.cycle()
+    C.append(("two bookmakers out of line on the same result count as one bet, at the better price",
+              len(e6.live) == 2 and len(e6.record) == 1 and e6.record[0]["price"] == 2.80))
+    kick7 = clock[0] + 100
+    e7 = Engine(interval=60, now_fn=lambda: clock[0], scrape_fn=lambda u: (page, None), news_fn=lambda rec: ("", ""), persist=False, in_play=True)
+    e7.add_watch("https://odds.example/m7", kickoff_ts=kick7); e7.cycle(); clock[0] += 130; e7.cycle(); clock[0] += 130; e7.cycle()
+    C.append(("with in-play reading on, a match is still read after kick-off and its entries are tagged", e7.matches and e7.matches[0]["in_play"]
+              and len(e7.matches[0]["hist"]) >= 2 and e7.record and e7.record[-1]["in_play"] in (True, False)))
+    e8 = Engine(interval=60, now_fn=lambda: clock[0], scrape_fn=lambda u: (page, None), news_fn=lambda rec: ("", ""), persist=False)
+    e8.add_watch("https://odds.example/m8", kickoff_ts=clock[0] - 5); e8.cycle()
+    C.append(("without it, a match that has kicked off is not read", e8.matches == []))
     C.append(("a pasted odds page is read, named from its heading and recorded", len(e2.record) == 1 and e2.record[0]["home"] == "Gamma Town" and e2.record[0]["url"] and e2.record[0]["verify"] == "seen"))
     clock[0] += 5 * 3600; e2.cycle()
     C.append(("a page-sourced entry is settled by lookup", e2.record[0]["result"] == "lost" and e2.record[0]["profit"] == -1.0))
@@ -1638,7 +1782,7 @@ def selftest():
               html_buttons(bpage.replace(side, ""), "stockport", "reading", info=i2) == {} and "could not tell" in i2["rows"]))
     hb2 = html_buttons(bpage.replace(side, ""), "stockport", "reading", rows_hint=["Stockport", "Reading", "Draw"])
     C.append(("row names supplied separately fix the order (home, away, draw as on the real site)", hb2["bet365"] == (2.5, 2.75, 3.4)))
-    C.append(("if the two sources of row names disagree the page is not used", html_buttons(bpage, "stockport", "reading", rows_hint=["Stockport", "Draw", "Reading"]) == {}))
+    C.append(("the page's own row names win over the model's", html_buttons(bpage, "stockport", "reading", rows_hint=["Stockport", "Draw", "Reading"]) == hb))
     side2 = '<div class="names"><span>Stockport</span><span>Reading</span><span>Draw</span></div>'
     hb4 = html_buttons(bpage.replace(side, side2), "stockport", "reading")
     C.append(("home, away, draw order is read correctly", hb4["bet365"] == (2.5, 2.75, 3.4)))
@@ -1710,6 +1854,13 @@ def selftest():
     bk4, _, _ = ctx_read_odds("k", "https://odds.example/flaky", post=flaky)
     C.append(("a page whose table had not loaded is read again with a longer wait", len(bk4) == 5 and seq == [3000, 9000]))
     far = Engine(interval=300, now_fn=lambda: clock[0], persist=False)
+    far.pending[("page:https://x/m", "Book", "home")] = {"first_seen": clock[0]}
+    C.append(("a page with a flag waiting to be confirmed is read again within a minute", far.cadence(clock[0] + 6 * 3600, "https://x/m") == 60
+              and far.cadence(clock[0] + 6 * 3600, "https://x/other") == 1200))
+    far.pending.clear()
+    far.failed.add("https://x/bad")
+    C.append(("a page whose last read failed is tried again within a minute", far.cadence(clock[0] + 6 * 3600, "https://x/bad") == 60))
+    far.failed.clear()
     C.append(("matches are read more often as kick-off approaches", far.cadence(clock[0] + 3 * 86400) == 3600 and far.cadence(clock[0] + 6 * 3600) == 1200
               and far.cadence(clock[0] + 3600) == 300 and far.cadence(None) == 300))
     C.append(("links are collected from the page and made absolute", lk == ["https://www.oddschecker.com/football/english/league-2/a-v-b/winner", "https://www.oddschecker.com/football/english/league-2/c-v-d/winner"]))
@@ -1762,6 +1913,7 @@ def main():
     p = sub.add_parser("serve"); p.add_argument("--port", type=int, default=8000)
     p.add_argument("--minutes", type=float, default=5.0, help="minutes between reads of a match in its last 3 hours")
     p.add_argument("--rediscover-hours", type=float, default=3.0, help="how often to look for new matches (0 = never)")
+    p.add_argument("--in-play", action="store_true", help="keep reading prices after kick-off (not covered by the test)")
     p.add_argument("--regions", default="uk,eu", help="bookmaker regions; each region costs one data credit per league per read")
     a = ap.parse_args()
     if a.cmd == "selftest":
@@ -1918,7 +2070,7 @@ def main():
         ok = Engine(odds_key=okey, ctx_key=ckey).add_watch(a.url, a.home, a.away, a.kickoff, "tested" if a.tested else "untested")
         print("added" if ok else "already being watched"); return
     if a.cmd == "serve":
-        eng = Engine(odds_key=okey, ctx_key=ckey, interval=max(60.0, a.minutes * 60), regions=a.regions)
+        eng = Engine(odds_key=okey, ctx_key=ckey, interval=max(60.0, a.minutes * 60), regions=a.regions, in_play=a.in_play)
         if eng.leagues and not okey:
             sys.exit("Leagues are being watched but ODDS_API_KEY is not set:  set ODDS_API_KEY=yourkey")
         if eng.watch and not ckey:
@@ -1930,6 +2082,7 @@ def main():
         print("Offside is running. Open http://127.0.0.1:%d in your browser. Ctrl+C to stop." % a.port)
         print("%d match page(s) watched. Each is read every %.0f min in its last 3 hours, every 20 min within a day, hourly before that."
               % (len(eng.watch), eng.interval / 60.0))
+        if a.in_play: print("In-play reading is ON: matches are read every 2 min after kick-off. The test does not cover in-play prices.")
         if eng.leagues: print("%d league feed(s), %d odds data credit(s) per read." % (len(eng.leagues), cost))
         if not ckey: print("CONTEXT_DEV_API_KEY is not set: team news notes and page watching are off.")
         try:

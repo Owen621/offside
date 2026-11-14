@@ -994,6 +994,8 @@ class Engine:
             for w in load("watch.json", []):
                 if w.get("url") and w["url"] not in have: self.watch.append(w)
         keep_live = [e for e in self.live]
+        already = {(r["mid"], r["book"], r["outcome"]) for r in self.record}
+        fresh_rows = []
         for m in self._gather():
             res = scan.analyse(m["books"]); near = nearest(m["books"])
             summary.append({"id": m["id"], "home": m["home"], "away": m["away"], "kickoff": m["kickoff"], "scope": m["scope"],
@@ -1002,14 +1004,24 @@ class Engine:
             if m.get("stale"):
                 live += [e for e in keep_live if e["mid"] == m["id"]]   # its flags stay on show until the next real read
                 continue                                           # old prices are never newly flagged or confirmed
+            fresh_rows.append({"t": round(self.now()), "match": "%s v %s" % (m["home"], m["away"]), "kickoff": m["kickoff"], "books": len(m["books"]),
+                               "avg": res["avg"] if res else None, "best": res["best"] if res else None,
+                               "flags": [[f["book"], f["outcome"], f["price"], f["points"]] for f in (res["flags"] if res else [])],
+                               "prices": {k: list(v) for k, v in m["books"].items()}})
             for f in (res["flags"] if res else []):
                 k = (m["id"], f["book"], f["outcome"]); seen_now.add(k)
                 entry = dict(f, mid=m["id"], url=m["url"], league=m["league"], league_title=m["league_title"], home=m["home"],
                              away=m["away"], kickoff=m["kickoff"], scope=m["scope"], link=(m.get("links") or {}).get(f["book"], ""))
+                if k in already and k not in self.pending:
+                    self.pending[k] = {"first_seen": self.now(), "recorded": True}
                 if k in self.pending:
                     entry["status"] = "confirmed"; entry["first_seen"] = self.pending[k]["first_seen"]
                     if not self.pending[k].get("recorded"):
-                        self._record(entry, m["proof"]); self.pending[k]["recorded"] = True
+                        if k not in already:
+                            self._record(entry, m["proof"])
+                            print("  %s  RECORDED: %s v %s, %s %s at %.2f (average %.2f)" % (time.strftime("%H:%M:%S"), m["home"], m["away"],
+                                                                                           f["book"], f["outcome"], f["price"], f["average"]))
+                        self.pending[k]["recorded"] = True
                     entry["news"] = self.pending[k].get("news", ""); entry["verify"] = self.pending[k].get("verify", "")
                 else:
                     entry["status"] = "checking"; entry["first_seen"] = self.now(); entry["news"] = ""; entry["verify"] = ""
@@ -1017,6 +1029,13 @@ class Engine:
                 live.append(entry)
         for k in [k for k in self.pending if k not in seen_now and k[0] not in self.unread]:
             del self.pending[k]                                    # back in line (or kicked off) before confirmation
+        if self.persist and fresh_rows:
+            try:
+                os.makedirs(DATA, exist_ok=True)
+                with open(os.path.join(DATA, "reads.jsonl"), "a", encoding="utf-8") as f:
+                    for row in fresh_rows: f.write(json.dumps(row) + "\n")
+            except Exception:
+                pass
         with self.lock:
             self.live = sorted(live, key=lambda e: (e["kickoff"] or 9e18, -e["edge_pct"]))
             self.matches = sorted(summary, key=lambda s: (s["kickoff"] or 9e18))
@@ -1475,8 +1494,8 @@ def run_loop(engine, stop, rediscover_hours=0):
             hubs = load("hubs.json", [])
             if rediscover_hours and hubs and engine.ctx_key and time.time() - last_find > rediscover_hours * 3600:
                 last_find = time.time()
-                print("  %s  looking for new matches ..." % time.strftime("%H:%M:%S"))
-                run_hub(engine, engine.ctx_key, hubs, log=lambda *a: None)
+                print("  %s  looking for new matches in the background ..." % time.strftime("%H:%M:%S"))
+                threading.Thread(target=lambda: run_hub(engine, engine.ctx_key, hubs, log=lambda *a: None, research=False, workers=2), daemon=True).start()
         except Exception as e:
             print("  scan pass failed: %s" % e)
         stop.wait(min(30, engine.interval))
@@ -1516,6 +1535,8 @@ def selftest():
     C.append(("a price is recognised as a decimal or a fraction, not inside other numbers", price_on_page("Alpha FC 7/4 Draw 23/10", 2.75) and price_on_page("home 2.75", 2.75)
               and not price_on_page("total 12.75 goals 17/4", 2.75) and not price_on_page("", 2.75)))
     C.append(("a third read does not record it again", len(e.record) == 1))
+    slow[0] = 2.31; clock[0] += 60; e.cycle(); slow[0] = 2.75; clock[0] += 60; e.cycle(); clock[0] += 60; e.cycle()
+    C.append(("a price that goes back in line and comes out again is not counted twice", len(e.record) == 1 and e.live and e.live[0]["status"] == "confirmed"))
     slow[0] = 2.31; clock[0] += 60; e.cycle()
     C.append(("when the price comes back in line the flag disappears", e.live == [] and len(e.record) == 1))
     n = e.matches[0]["nearest"]

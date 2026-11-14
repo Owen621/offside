@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import odds
 import scan
 
-VERSION = "build 32"          # shown at start-up and at the foot of the dashboard
+VERSION = "build 33"          # shown at start-up and at the foot of the dashboard
 DATA = "offside_data"
 ODDS_API = "https://api.the-odds-api.com/v4"
 EXCHANGE = re.compile(r"betfair_ex|matchbook|smarkets|exchange", re.I)     # exchanges are not bookmaker prices
@@ -1346,7 +1346,7 @@ def card_payload(d):
              "footer": {"text": "Offside. Prices move, so check the price before betting."},
              "timestamp": dt.datetime.fromtimestamp(d.get("t_seen") or time.time(), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")}
     if link: embed["url"] = link
-    logo = (brand_of(book).get("png") or "") if not d.get("sample") else ""
+    logo = brand_of(book).get("png") or ""
     if logo:
         embed["author"] = dict({"name": book, "icon_url": logo}, **({"url": link} if link else {}))
     head = {"gone": "No longer out of line", "confirmed": "Confirmed"}.get(stage, "Out of line")
@@ -1375,7 +1375,7 @@ def result_payload(r, tally=None, sample=False):
     embed = {"title": head, "description": "\n".join(lines), "color": 0x3DF2A4 if won else 0xFF6B81,
              "footer": {"text": "Sample result from the alert test. Not a real result. It removes itself shortly." if sample else "Offside. One shared record. No real money is involved."},
              "timestamp": dt.datetime.fromtimestamp(time.time(), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")}
-    logo = (brand_of(r["book"]).get("png") or "") if not sample else ""
+    logo = brand_of(r["book"]).get("png") or ""
     if logo: embed["author"] = {"name": r["book"], "icon_url": logo}
     return {"content": ("SAMPLE, not a real result. " if sample else "") + "%s: %s at %s, %.2f. %s v %s %s" % ("Won" if won else "Lost", who, r["book"], r["price"], r["home"], r["away"], r.get("score") or ""),
             "embeds": [embed], "allowed_mentions": {"parse": []}}
@@ -3734,6 +3734,8 @@ def main():
     sub.add_parser("selftest"); sub.add_parser("evidence"); sub.add_parser("leagues")
     p = sub.add_parser("alert-test"); p.add_argument("--ntfy", default="", help="ntfy.sh topic to send the test to")
     p.add_argument("--sample", action="store_true", help="send what a real pair of alerts looks like")
+    p.add_argument("--book", default="", help="with --sample, the bookmaker to show, such as bet365. Left out, one with a logo is picked at random")
+    p.add_argument("--keep", action="store_true", help="with --sample, leave the sample cards in the channel")
     p = sub.add_parser("betlinks", help="show what an odds page holds that could link straight to a bookmaker's bet"); p.add_argument("url")
     p = sub.add_parser("logos", help="fetch every bookmaker's logo through Context.dev's brand data")
     p.add_argument("--refresh", action="store_true", help="fetch them all again, not only the missing ones")
@@ -3794,22 +3796,29 @@ def main():
             if "discord" not in hook_:
                 sys.exit("The sample card needs a Discord webhook:  set OFFSIDE_WEBHOOK=<the webhook address>")
             print("posting a sample card to the Discord webhook ending ...%s" % hook_[-6:])
-            d_ = {"home": "Home Team", "away": "Away Team", "book": "Star Sports", "outcome": "away", "price": 1.73, "average": 1.64, "kickoff": time.time() + 3600,
-                  "odds_url": "https://www.oddschecker.com/football", "site": book_site("Star Sports"), "t_seen": time.time(), "stage": "seen", "sample": True}
+            with_logo = sorted({v.get("title") or k for k, v in brands().items() if v.get("png")})
+            names_ = {re.sub(r"[^a-z0-9]", "", n.lower()): n for n in list(BK_CODES.values()) + with_logo}
+            bk_ = names_.get(re.sub(r"[^a-z0-9]", "", a.book.lower()), a.book) if a.book else (random.choice([n for n in BK_CODES.values() if brand_of(n).get("png")] or ["Star Sports"]))
+            print("  bookmaker shown: %s%s" % (bk_, "" if brand_of(bk_).get("png") else "  (no logo is stored for it: run  python app.py logos)"))
+            d_ = {"home": "Home Team", "away": "Away Team", "book": bk_, "outcome": "away", "price": 1.73, "average": 1.64, "kickoff": time.time() + 3600,
+                  "odds_url": "https://www.oddschecker.com/football", "site": book_site(bk_), "t_seen": time.time(), "stage": "seen", "sample": True}
             try:
                 mid_ = discord_card(hook_, card_payload(d_))
                 print("  posted (first sighting). It will now be edited twice, as a real alert would be.")
-                time.sleep(4); d_["source"] = ["seen", book_site("Star Sports"), 1.73]; discord_card(hook_, card_payload(d_), mid_)
+                time.sleep(4); d_["source"] = ["seen", book_site(bk_), 1.73]; discord_card(hook_, card_payload(d_), mid_)
                 time.sleep(4); d_.update(stage="confirmed", record="added"); discord_card(hook_, card_payload(d_), mid_)
-                print("  done: one message, updated in place. It is marked as a sample and will remove itself in 25 seconds.")
+                print("  done: one message, updated in place. It is marked as a sample%s." % ("" if a.keep else " and will remove itself in 25 seconds"))
                 rh_ = results_hook(); rid_ = None
                 if rh_:
-                    rid_ = discord_card(rh_, result_payload({"home": "Home Team", "away": "Away Team", "outcome": "away", "book": "Star Sports", "price": 1.73, "result": "won", "score": "0-2",
+                    rid_ = discord_card(rh_, result_payload({"home": "Home Team", "away": "Away Team", "outcome": "away", "book": bk_, "price": 1.73, "result": "won", "score": "0-2",
                                                              "stake": 20.0, "profit": 0.73, "close_avg": 1.62}, {"finished": 5, "won": 2, "bank": 994.6, "start": 1000.0}, sample=True))
                     print("  a sample result card was posted to the %s channel." % ("results" if os.environ.get("OFFSIDE_RESULTS_WEBHOOK") else "alerts"))
-                time.sleep(25); discord_delete(hook_, mid_)
-                if rid_: discord_delete(rh_, rid_)
-                print("  samples removed.")
+                if a.keep:
+                    print("  samples left in the channel. Delete them by hand when you have seen them.")
+                else:
+                    time.sleep(25); discord_delete(hook_, mid_)
+                    if rid_: discord_delete(rh_, rid_)
+                    print("  samples removed.")
             except urllib.error.HTTPError as e:
                 print("  Discord refused it: HTTP %d %s" % (e.code, e.read().decode("utf-8", "replace")[:200]))
             except Exception as e:

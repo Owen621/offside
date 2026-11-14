@@ -181,9 +181,6 @@ Options for `serve`:
 
 ## What comes next
 
-- Context.dev monitors for league pages, so a changed fixture list triggers the search for new matches.
-- bet365 pages for every league, found without being pasted in.
-- Proper hosting, in place of a laptop.
 - Placing bets is not built. It would need bookmaker accounts and raises regulatory questions.
 
 ## Files

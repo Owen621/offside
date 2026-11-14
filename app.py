@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import odds
 import scan
 
-VERSION = "build 31"          # shown at start-up and at the foot of the dashboard
+VERSION = "build 32"          # shown at start-up and at the foot of the dashboard
 DATA = "offside_data"
 ODDS_API = "https://api.the-odds-api.com/v4"
 EXCHANGE = re.compile(r"betfair_ex|matchbook|smarkets|exchange", re.I)     # exchanges are not bookmaker prices
@@ -2245,7 +2245,8 @@ class Engine:
                     "pages": [dict(w, source=self.sources.get(w["url"], {})) for w in self.watch],
                     "live": [dict(e, field=self._field(e), **self._book_page(e)) for e in self.live], "matches": list(self.matches)[:80], "record": list(reversed(self.record)),
                     "closest": self._closest(),
-                    "summary": {"recorded": len(self.record), "settled": len(settled),
+                    "summary": {"recorded": len(self.record), "shots": sum(1 for r in self.record if r.get("shot")), "news": sum(1 for r in self.record if r.get("news")),
+                                "settled": len(settled),
                                 "won": sum(1 for r in settled if r["result"] == "won"), "profit": round(profit, 2),
                                 "roi": (profit / len(settled)) if settled else None},
                     "evidence": load("evidence.json", None)}
@@ -2964,7 +2965,7 @@ function renderWork(){
   const s=S.stats||{}; if(!s.pages){ $("work").style.display="none"; return; }
   $("work").style.display="";
   const items=[["pages",s.pages,"odds pages read through Context.dev"],["prices",s.prices,"bookmaker prices read from them"],["seen",(S.seen||[]).length,"prices seen out of line"],
-    ["rec",S.summary.recorded,"confirmed and recorded"],["shots",s.screenshots,"proof screenshots"],["news",s.news,"team-news searches"]];
+    ["rec",S.summary.recorded,"confirmed and recorded"],["shots",S.summary.shots,"proof screenshots"],["news",S.summary.news,"team-news searches"]];
   const key=items.map(x=>x[0]).join();
   if(key!==workKey){ workKey=key; $("work").innerHTML=items.map(x=>"<div class='kpi'><b data-k='"+x[0]+"'>0</b><span>"+x[2]+"</span></div>").join("")+
     "<div class='kpi'><b class='plain' id='since'></b><span>running since</span></div>"; }
@@ -3370,7 +3371,7 @@ def _selftest():
     lifted_ = (len(e18.live), len(e18.record))
     e18.window_h = 48; e18.read_at = {}; clock[0] += 61; e18.cycle()
     C.append(("a match more than 48 hours from kick-off is watched but not flagged or recorded, and lifting the window flags it",
-              far_ == (0, 0, 0) and lifted_[0] >= 1 and lifted_[1] == 1 and len(e18.live) == 0 and e18.state()["window_h"] == 48 and e18.state()["matches"][0]["early"] is True))
+              far_ == (0, 0, 0) and lifted_[0] >= 1 and lifted_[1] == 1 and e18.state()["summary"]["shots"] <= e18.state()["summary"]["recorded"] and len(e18.live) == 0 and e18.state()["window_h"] == 48 and e18.state()["matches"][0]["early"] is True))
     C.append(("a price confirmed after its card was lost still gets a card, in its confirmed state", len(posts_) >= 1 and posts_[-1][1]["content"].startswith("Confirmed")
               and "Added to the record" in posts_[-1][1]["embeds"][0]["description"]))
     sent_c = []

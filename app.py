@@ -37,6 +37,7 @@ Nothing here places a bet.
 import argparse
 import datetime as dt
 import hashlib
+import io
 import json, math
 import os
 import random
@@ -52,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import odds
 import scan
 
-VERSION = "build 13"          # shown at start-up and at the foot of the dashboard
+VERSION = "build 31"          # shown at start-up and at the foot of the dashboard
 DATA = "offside_data"
 ODDS_API = "https://api.the-odds-api.com/v4"
 EXCHANGE = re.compile(r"betfair_ex|matchbook|smarkets|exchange", re.I)     # exchanges are not bookmaker prices
@@ -513,6 +514,49 @@ def rules_books(parsed, home="", away="", info=None):
     return valid_books(found)
 
 
+def page_feed(page_html, grid):
+    """The odds page carries a data block with, for every price, when the bookmaker's feed last changed it and the
+    bookmaker's own id for that selection. Returns {bookmaker: {"home"|"draw"|"away": {"t": epoch, "sel": id, "status": s}}}.
+    Each bet in the block is matched to home, draw or away by comparing its prices with the prices read from the grid."""
+    import calendar, html as _html
+    out = {}
+    if not page_html or not grid:
+        return out
+    txt = _html.unescape(page_html)
+    dec = json.JSONDecoder()
+    code_of = {v: k for k, v in BK_CODES.items()}
+    for m in re.finditer(r'"odds"\s*:\s*\{"\d', txt):
+        try:
+            odds, _ = dec.raw_decode(txt, m.end() - 3)
+        except Exception:
+            continue
+        if not isinstance(odds, dict):
+            continue
+        for bet in odds.values():
+            if not isinstance(bet, dict):
+                continue
+            score = [0, 0, 0]
+            for name, trio in grid.items():
+                e = bet.get(code_of.get(name, name))
+                if isinstance(e, dict) and isinstance(e.get("oddsDecimal"), (int, float)):
+                    for i in range(3):
+                        if abs(trio[i] - e["oddsDecimal"]) < 0.011: score[i] += 1
+            i = max(range(3), key=lambda j: score[j])
+            if score[i] < 3 or sorted(score)[-2] >= score[i]:
+                continue                                           # not one of the three results in the grid
+            label = ("home", "draw", "away")[i]
+            for name in grid:
+                e = bet.get(code_of.get(name, name))
+                if not isinstance(e, dict): continue
+                t = None
+                try: t = calendar.timegm(time.strptime(str(e.get("betFeedTimestamp"))[:19], "%Y-%m-%dT%H:%M:%S"))
+                except Exception: pass
+                out.setdefault(name, {})[label] = {"t": t, "sel": str(e.get("selectionId") or ""), "status": str(e.get("status") or "")}
+        if out:
+            break
+    return out
+
+
 def grid_from_text(md):
     """Read a bookmakers-in-columns table from the page text: three neighbouring rows (home, draw, away), each
     holding one price per bookmaker. Bookmaker names come from the header row above when it lines up."""
@@ -652,6 +696,8 @@ def ctx_read_odds(key, url, post=None, light=False):
                 grid = coherent(html_grid(page_html)) or coherent(html_buttons(page_html, *teams_in_address(url)))
                 method = "HTML from Context.dev"
             _note_read(url, res, method)
+            try: READ_META[url]["feed"] = page_feed((res.get("html") or {}).get("data") or "", grid)
+            except Exception: pass
             if len(grid) >= scan.MIN_BOOKS:
                 return grid, "(prices read with %s)\n\n%s" % (method, page_text or ""), ""
         except Exception:
@@ -707,6 +753,8 @@ def ctx_read_odds(key, url, post=None, light=False):
         if page_html and len(re.findall(r"<button[^>]*data-bk", page_html)) >= 15:
             extracted, plain = {}, {}                              # a button grid: read exactly or not at all
         books = next((b for b in (grid, extracted, plain) if len(b) >= scan.MIN_BOOKS), max((grid, extracted, plain), key=len))
+        try: READ_META[url]["feed"] = page_feed(page_html, books)
+        except Exception: pass
         if len(books) > len(best) or best_md is None:
             best, best_md = books, md
         if len(books) >= scan.MIN_BOOKS:
@@ -799,7 +847,7 @@ SOURCE_SCHEMA = {"type": "object", "properties": {
     "required": ["is_this_match"], "additionalProperties": False}
 
 
-def ctx_confirm_at_source(key, book, home, away, price, outcome="home", http=None):
+def ctx_confirm_at_source(key, book, home, away, price, outcome="home", http=None, known=""):
     """Find the bookmaker's OWN page for this match and read its price there. Three Context.dev calls work together:
     search (limited to the bookmaker's site) and a researched answer both look for the page; a scrape with JSON
     extraction then reads the three match-result prices from it.
@@ -837,17 +885,20 @@ def ctx_confirm_at_source(key, book, home, away, price, outcome="home", http=Non
         except Exception:
             pass
     cands.sort(key=lambda c: not c[1])
+    if known:                                                          # the bookmaker's page for this league is already known: read it first
+        cands = [(known, True)] + [c for c in cands if c[0] != known]
     def tidy(u):                                                      # drop tracking and affiliate parameters from the link
         pr = urllib.parse.urlparse(u)
         keep = [(k, v) for k, v in urllib.parse.parse_qsl(pr.query) if not re.match(r"(btag|account|static|affid|aff|ref|clickid|utm_.*)$", k, re.I)]
         return urllib.parse.urlunparse(pr._replace(query=urllib.parse.urlencode(keep)))
     def read(u):
         try:
-            return http(scan.CTX_SCRAPE, {"url": u, "formats": {"markdown": True, "json": True},
+            return http(scan.CTX_SCRAPE, {"url": u, "formats": {"markdown": True, "json": True, "parse": True},
+                                          "parseParams": {"rules": {"links": {"selector": "a[href]", "type": "list", "output": "@href"}}},
                                           "jsonParams": {"schema": SOURCE_SCHEMA, "instructions": "The match is %s (home) v %s (away). Give decimal odds; convert fractions "
                                                          "(6/4 is 2.50; a whole number such as 2 means 2/1, which is 3.00). Use null for a price you cannot see. If the page "
                                                          "lists several matches, use the row for this match and set is_this_match to true." % (home, away)},
-                                          "sharedParams": {"waitFor": 3000, "country": "GB", "dismissPopups": True}, "maxAgeMs": 0,
+                                          "sharedParams": {"waitFor": 6000 if u == known else 3000, "country": "GB", "dismissPopups": True}, "maxAgeMs": 0,
                                           "timeoutOpts": {"milliseconds": 45000, "behavior": "return-partial"}}, 75)
         except Exception:
             return None
@@ -857,29 +908,39 @@ def ctx_confirm_at_source(key, book, home, away, price, outcome="home", http=Non
         with ThreadPoolExecutor(max_workers=len(top)) as ex: pages = list(ex.map(lambda c: read(c[0]), top))
     else:
         pages = [read(c[0]) for c in top]
-    fallback = None
+    fallback, any_read = None, False
     for (u, _), res in zip(top, pages):
         if res is None: continue
-        u = tidy(u)
+        is_known = bool(known) and u == known
+        u = u if is_known else tidy(u)
         text = (res.get("markdown") or {}).get("data") or ""
         js = (res.get("json") or {}).get("data") if (res.get("json") or {}).get("success") else None
         js = js if isinstance(js, dict) else {}
         if not text and not js: continue
+        any_read = True
         if re.search(r"/(news|article|articles|blog|tips|promotions?|offers?|help)(/|$)|news\.", u, re.I):
             continue                                               # an article or an offers page, not prices
-        if not (js.get("is_this_match") or named(text[:20000])):
-            continue                                               # some other page on the bookmaker's site
         there = js.get({"home": "home_win", "draw": "draw", "away": "away_win"}[outcome])
         try: there = float(there) if there and float(there) > 1.0 else None
         except (TypeError, ValueError): there = None
+        if not (js.get("is_this_match") or named(text[:20000]) or (is_known and there)):
+            continue                                               # some other page on the bookmaker's site
         match_page = named(urllib.parse.urlparse(u).path.replace("-", " ").replace("_", " "))   # the address itself names the match
+        if not match_page:                                         # a list of matches: use its link to this match's own page, if it has one
+            pr = res.get("parsed") or {}
+            for h in ((pr.get("data") or {}).get("links") or []) if pr.get("success") else []:
+                full = urllib.parse.urljoin(u, str(h or ""))
+                if site in urllib.parse.urlparse(full).netloc and named(urllib.parse.urlparse(full).path.replace("-", " ").replace("_", " ")) \
+                        and not re.search(r"/(news|article|articles|blog|tips|promotions?|offers?|help)(/|$)", full, re.I):
+                    u = tidy(full); match_page_link = True; break
         if (there and abs(there - price) / price < 0.012) or (not there and match_page and price_on_page(text, price)):
             return "seen", u, text[:30000], there or price
         if there:
             return "moved", u, text[:30000], there
-        if match_page or js.get("is_this_match"):
+        if match_page or js.get("is_this_match") or is_known:
             fallback = fallback or ("not shown", u, text[:30000], None)     # the bookmaker's page for the match, price not read
-    return fallback or ("unreadable", "", "", None)
+    # "no page": nothing to read was found. "blocked": pages were found but would not open. "not listed": pages opened, the match was not on them.
+    return fallback or ("not listed" if any_read else "blocked" if top else "no page", known or "", "", None)
 
 
 RESEARCH = "research:"
@@ -1064,7 +1125,284 @@ def send_sms(sid, token, sender, to, text):
     urllib.request.urlopen(req, timeout=15).close()
 
 
-def notify(title, message, click="", post=None, sms=None, problems=None):
+# A bookmaker's page for a league, keyed by the league as it appears in the odds site's addresses. More are added with:
+#   python app.py bookpage "bet365" "english/league-2" "the address of bet365's League Two page"
+BOOK_PAGES = {"bet365": {"english/league-1": "https://www.bet365.com/#/AC/B1/C1/D1002/E135398820/G40/"}}
+_BOOK_PAGES_CACHE = {"t": 0, "v": None}
+
+
+def league_key(odds_url):
+    """'english/league-1' from .../football/english/league-1/barnsley-v-sheffield-wednesday/winner"""
+    m = re.search(r"/football/([^/]+/[^/]+)/[^/]+/", odds_url or "")
+    return m.group(1).lower() if m else ""
+
+
+def book_pages():
+    if _BOOK_PAGES_CACHE["v"] is None or time.time() - _BOOK_PAGES_CACHE["t"] > 20:
+        out = {k: dict(v) for k, v in BOOK_PAGES.items()}
+        for k, v in (load("book_pages.json", {}) or {}).items():
+            if isinstance(v, dict): out.setdefault(k, {}).update(v)
+        _BOOK_PAGES_CACHE.update(t=time.time(), v=out)
+    return _BOOK_PAGES_CACHE["v"]
+
+
+def book_page_for(book, odds_url):
+    """The bookmaker's own page that lists this match's league, or ''."""
+    return (book_pages().get(re.sub(r"[^a-z0-9]", "", (book or "").lower())) or {}).get(league_key(odds_url), "")
+
+
+CTX_CALLS = {"prices": 0, "links": 0, "extract": 0, "screenshot": 0, "search": 0, "answers": 0, "brand": 0, "since": None}
+CTX_BRAND = "https://api.context.dev/v1/brand/retrieve"
+_BRANDS_CACHE = {"t": 0, "v": None}
+
+
+def pick_logo(brand):
+    """From Context.dev's brand data, choose the mark to show beside a bookmaker's name. Returns {"icon", "png", "bg", "color"} or {}.
+    A square icon is preferred to a wide logo, and one with its own background to one that needs a matching page colour."""
+    logos = [l for l in (brand or {}).get("logos") or [] if isinstance(l, dict) and str(l.get("url") or "").startswith("http")]
+    if not logos:
+        return {}
+    def score(l):
+        res = l.get("resolution") or {}
+        w, h = res.get("width") or 0, res.get("height") or 0
+        square = bool(w and h and 0.8 <= w / float(h) <= 1.25)
+        return (2 if l.get("type") == "icon" else 0) + (2 if square else 0) + (1 if l.get("mode") == "has_opaque_background" else 0)
+    best = max(logos, key=score)
+    raster = [l for l in logos if not re.search(r"\.svg(\?|$)", l["url"], re.I)]
+    png = max(raster, key=score)["url"] if raster else ""
+    colors = [c.get("hex") for c in (brand or {}).get("colors") or [] if isinstance(c, dict) and re.match(r"^#?[0-9a-fA-F]{6}$", str(c.get("hex") or ""))]
+    bg = "" if best.get("mode") == "has_opaque_background" else ("#10142b" if best.get("mode") == "dark" else "#ffffff")
+    return {"icon": best["url"], "png": png, "bg": bg, "color": ("#" + colors[0].lstrip("#")) if colors else ""}
+
+
+def ctx_brand(key, domain, get=None):
+    """Brand data for a company's site from Context.dev: its logos and colours. Returns (brand dict or None, reason)."""
+    CTX_CALLS["brand"] += 1
+    def plain(url, body=None):
+        req = urllib.request.Request(url, data=(json.dumps(body).encode() if body is not None else None), method="POST" if body is not None else "GET",
+                                     headers={"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=75) as r:
+            return json.loads(r.read().decode())
+    get = get or plain
+    why = ""
+    for attempt in ((CTX_BRAND + "?domain=" + urllib.parse.quote(domain) + "&timeoutMS=60000", None), (CTX_BRAND, {"type": "by_domain", "domain": domain})):
+        try:
+            res = get(*attempt)
+            brand = (res or {}).get("brand") or ((res or {}).get("data") or {}).get("brand")
+            if isinstance(brand, dict):
+                return brand, ""
+            why = "no brand in the reply: %s" % json.dumps(res)[:160]
+        except urllib.error.HTTPError as e:
+            why = "HTTP %d %s" % (e.code, e.read().decode()[:160])
+            if e.code not in (404, 405): break                     # only a refused form of the request is worth trying the other way
+        except Exception as e:
+            why = str(e)[:160]; break                              # a timeout or a dropped connection: leave it for the next run
+    return None, why
+
+
+def brands():
+    """Logos already fetched, by bookmaker."""
+    if _BRANDS_CACHE["v"] is None or time.time() - _BRANDS_CACHE["t"] > 20:
+        _BRANDS_CACHE.update(t=time.time(), v=load("brands.json", {}) or {})
+    return _BRANDS_CACHE["v"]
+
+
+def brand_of(book):
+    b = brands().get(re.sub(r"[^a-z0-9]", "", (book or "").lower())) or {}
+    return b if b.get("icon") else {}
+
+
+def fetch_brands(key, only_missing=True, log=print, get=None, workers=5):
+    """Fetch the logo for every bookmaker site not fetched yet, through Context.dev's brand data. Returns how many now have one."""
+    from concurrent.futures import ThreadPoolExecutor
+    saved = dict(load("brands.json", {}) or {})
+    by_domain = {}
+    for name, domain in BOOK_SITES.items():
+        by_domain.setdefault(domain, []).append(name)
+    todo = [d for d, names in by_domain.items() if not only_missing or not any(saved.get(n) and (saved[n].get("icon") or time.time() - saved[n].get("t", 0) < 86400) for n in names)]
+    def one(domain):
+        brand, why = ctx_brand(key, domain, get=get)
+        return domain, (pick_logo(brand) if brand else None), why, (brand or {}).get("title") or ""
+    from concurrent.futures import as_completed
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for fut in as_completed([ex.submit(one, d) for d in todo]):
+            domain, got, why, title = fut.result(); done += 1
+            if got is None:                                            # the lookup itself failed: say so and try again next time
+                log("  %-22s lookup failed, will be tried again next time: %s   (%d of %d)" % (domain, why, done, len(todo))); continue
+            for name in by_domain[domain]:
+                saved[name] = dict(got, t=time.time(), domain=domain, title=title)
+            save("brands.json", saved)                                 # kept as each one arrives, so stopping early loses nothing
+            log("  %-22s %s   (%d of %d)" % (domain, ("logo found" + (" (%s)" % title if title else "")) if got.get("icon") else "no logo in the brand data", done, len(todo)))
+    save("brands.json", saved)
+    _BRANDS_CACHE["v"] = None
+    return sum(1 for d, names in by_domain.items() if saved.get(names[0], {}).get("icon"))
+_plain_http = scan.http
+
+
+def _counting_http(url, body, key, timeout=90):
+    """Every Context.dev call goes through here, so the dashboard can show how each endpoint is being used."""
+    try:
+        if CTX_CALLS["since"] is None: CTX_CALLS["since"] = time.time()
+        f = (body or {}).get("formats") or {}
+        kind = ("search" if url == CTX_SEARCH else "answers" if url == scan.CTX_ANSWERS else "screenshot" if f.get("screenshot") else
+                "prices" if f.get("html") else "extract" if f.get("json") else "links")
+        CTX_CALLS[kind] += 1
+    except Exception:
+        pass
+    return _plain_http(url, body, key, timeout=timeout)
+
+
+scan.http = _counting_http
+
+
+def book_site(name):
+    """The bookmaker's own site address, or '' if it is not in the list."""
+    d = BOOK_SITES.get(re.sub(r"[^a-z0-9]", "", (name or "").lower()))
+    return ("https://" + d) if d else ""
+
+
+def discord_card(hook, payload, message_id=None, send=None):
+    """Post a card to a Discord webhook, or edit the one already posted there. Returns the message id."""
+    def real(url, body, method):
+        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method=method,
+                                     headers={"Content-Type": "application/json", "User-Agent": "Offside/1.0 (+https://github.com)"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read().decode("utf-8", "replace")
+        return json.loads(raw) if raw.strip() else {}
+    send = send or real
+    hook = hook.split("?")[0].rstrip("/")
+    if message_id:
+        send(hook + "/messages/" + str(message_id), payload, "PATCH")
+        return message_id
+    return (send(hook + "?wait=true", payload, "POST") or {}).get("id")
+
+
+def how_long(seconds):
+    """'12 min', '3 h 05 min', '2 days'."""
+    s = max(0, int(seconds))
+    if s < 90: return "%d s" % s
+    if s < 5400: return "%d min" % round(s / 60.0)
+    if s < 2 * 86400: return "%d h %02d min" % (s // 3600, (s % 3600) // 60)
+    return "%d days" % round(s / 86400.0)
+
+
+def card_payload(d):
+    """The Discord message for one flagged price. The title links to the bookmaker: its page for the match once that is
+    found, its site until then. The same message is edited as the price is confirmed, checked or gone."""
+    who = {"home": d["home"] + " to win", "draw": "The draw", "away": d["away"] + " to win"}[d["outcome"]]
+    src = d.get("source") or None
+    stage, book = d.get("stage", "seen"), d["book"]
+    found = src[1] if (src and src[1]) else ""                       # the bookmaker's own page for this match, if one was found
+    row = {"home": d["home"], "draw": "Draw", "away": d["away"]}[d["outcome"]]
+    lpage = d.get("league_page") or ""
+    if found and lpage and found == lpage: found = ""              # the league page is described as what it is
+    link = found or lpage or d.get("site") or d.get("odds_url") or ""
+    pct = round(100 * (d["price"] / d["average"] - 1))
+    at = lambda t: time.strftime("%H:%M:%S", time.localtime(t))
+    seen_at = d.get("t_seen") or time.time()
+    lines = ["\u2705 Seen on the odds page at %s" % at(seen_at)]
+    if stage == "gone":
+        lines.append("\u274c " + (d.get("why") or "No longer out of line on the next read."))
+    elif stage == "confirmed":
+        lines.append("\u2705 Still out of line a minute later")
+    else:
+        lines.append("\u23f3 Reading again in about a minute")
+    if src:
+        lines.append({"seen": "\u2705 Same price on %s's own site" % book,
+                      "moved": "\u2796 %s's own site shows %s now" % (book, ("%.2f" % src[2]) if (len(src) > 2 and src[2]) else "a different price"),
+                      "not shown": "\u2796 %s's page found, price not read" % book,
+                      "not listed": "\u2796 %s's pages were read, this match was not on them" % book,
+                      "no page": "\u2796 No page for this match was found on %s's site" % book,
+                      "blocked": "\u2796 %s's page would not open" % book}.get(src[0], "\u2796 %s's own site could not be reached" % book))
+    elif stage != "gone":
+        lines.append("\u23f3 Checking %s's own site" % book)
+    if d.get("record") == "added":
+        lines.append("\u2705 Added to the record")
+    elif d.get("record") == "already" and d.get("had"):
+        lines.append("\u2796 Already in the record at %.2f with %s" % (d["had"][1], d["had"][0]))
+    notes = []
+    if d.get("feed_t"):
+        notes.append("%s's price last changed on the odds site %s before this." % (book, how_long(seen_at - d["feed_t"])))
+    if d.get("kickoff") and d["kickoff"] - seen_at > 3 * 86400:
+        notes.append("Kick-off is more than 3 days away, which is earlier than the test covers.")
+    if d.get("average_now") and abs(d["average_now"] / d["average"] - 1) > 0.004:
+        notes.append("Since it was first seen the rest have moved from %.2f to %.2f, %s %s's price." % (
+            d["average"], d["average_now"], "towards" if d["average_now"] > d["average"] else "away from", book))
+    links = []
+    if found:
+        links.append("[Open %s's page for this match](%s)" % (book, found))
+    elif lpage:
+        links.append("[Open %s's page for this league, where the match is listed](%s)" % (book, lpage))
+    elif d.get("site"):
+        links.append("[Open %s](%s)" % (book, d["site"]))
+    if d.get("odds_url"):
+        links.append("[All bookmakers' prices](%s)" % d["odds_url"])
+    kick = time.strftime("%a %H:%M", time.localtime(d["kickoff"])) if d.get("kickoff") else "time unknown"
+    embed = {"title": "%s at %s: %.2f" % (who, book, d["price"]),
+             "description": "**%s v %s**, kick-off %s\nEveryone else averages **%.2f**. This is **+%d%%** above them.\n\n%s%s\n\n%s" % (
+                 d["home"], d["away"], kick, d["average"], pct, "\n".join(lines), ("\n\n" + "\n".join(notes)) if notes else "", "\n".join(links)),
+             "color": {"gone": 0x8F9BD6, "confirmed": 0x3DF2A4}.get(stage, 0xFFC83D),
+             "footer": {"text": "Offside. Prices move, so check the price before betting."},
+             "timestamp": dt.datetime.fromtimestamp(d.get("t_seen") or time.time(), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")}
+    if link: embed["url"] = link
+    logo = (brand_of(book).get("png") or "") if not d.get("sample") else ""
+    if logo:
+        embed["author"] = dict({"name": book, "icon_url": logo}, **({"url": link} if link else {}))
+    head = {"gone": "No longer out of line", "confirmed": "Confirmed"}.get(stage, "Out of line")
+    if d.get("sample"):
+        head = "SAMPLE, not a live price. " + head
+        embed["footer"] = {"text": "Sample card from the alert test. Not a live price. It removes itself shortly."}
+    return {"content": "%s: %s at %s, %.2f (+%d%% above the rest). %s v %s" % (head, who, book, d["price"], pct, d["home"], d["away"]),
+            "embeds": [embed], "allowed_mentions": {"parse": []}}
+
+
+def result_payload(r, tally=None, sample=False):
+    """The Discord card for a finished match: what was backed, the score, and what it did to the record."""
+    won = r["result"] == "won"
+    who = {"home": r["home"] + " to win", "draw": "The draw", "away": r["away"] + " to win"}[r["outcome"]]
+    stake = r.get("stake") or 0.0
+    money = stake * (r.get("profit") or 0.0)
+    lines = ["**%s at %s, %.2f**" % (who, r["book"], r["price"]),
+             "Stake %.2f. %s %.2f." % (stake, "Profit" if money >= 0 else "Loss", abs(money))]
+    if r.get("close_avg"):
+        d_ = round(100 * (r["price"] / r["close_avg"] - 1))
+        lines.append("At kick-off the rest averaged %.2f, so the price taken was %s." % (r["close_avg"], ("%d%% better" % d_) if d_ > 0 else ("%d%% worse" % -d_) if d_ < 0 else "the same"))
+    if tally:
+        lines.append("")
+        lines.append("Record so far: %d finished, %d won. The bank is %.2f, from a start of %.2f." % (tally["finished"], tally["won"], tally["bank"], tally["start"]))
+    head = ("Won" if won else "Lost") + ": %s v %s, %s" % (r["home"], r["away"], r.get("score") or "")
+    embed = {"title": head, "description": "\n".join(lines), "color": 0x3DF2A4 if won else 0xFF6B81,
+             "footer": {"text": "Sample result from the alert test. Not a real result. It removes itself shortly." if sample else "Offside. One shared record. No real money is involved."},
+             "timestamp": dt.datetime.fromtimestamp(time.time(), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")}
+    logo = (brand_of(r["book"]).get("png") or "") if not sample else ""
+    if logo: embed["author"] = {"name": r["book"], "icon_url": logo}
+    return {"content": ("SAMPLE, not a real result. " if sample else "") + "%s: %s at %s, %.2f. %s v %s %s" % ("Won" if won else "Lost", who, r["book"], r["price"], r["home"], r["away"], r.get("score") or ""),
+            "embeds": [embed], "allowed_mentions": {"parse": []}}
+
+
+def results_hook():
+    """Where results are posted: the results channel's webhook if set, otherwise the alerts one."""
+    env = lambda k: (os.environ.get(k) or "").strip().strip('"')
+    h = env("OFFSIDE_RESULTS_WEBHOOK") or env("OFFSIDE_WEBHOOK")
+    return h if "discord" in h else ""
+
+
+def results_tag():
+    """A short fingerprint of the dedicated results webhook, or '' when results share the alerts channel. Not the address itself."""
+    import hashlib
+    h = (os.environ.get("OFFSIDE_RESULTS_WEBHOOK") or "").strip().strip('"')
+    return hashlib.sha1(h.encode()).hexdigest()[:8] if "discord" in h else ""
+
+
+def discord_delete(hook, message_id):
+    """Remove a message this webhook posted."""
+    req = urllib.request.Request(hook.split("?")[0].rstrip("/") + "/messages/" + str(message_id), method="DELETE",
+                                 headers={"User-Agent": "Offside/1.0 (+https://github.com)"})
+    urllib.request.urlopen(req, timeout=15).close()
+
+
+def notify(title, message, click="", post=None, sms=None, problems=None, discord=True):
     """Send an alert. Returns how many were sent; reasons for any failure are appended to `problems`.
     OFFSIDE_WEBHOOK = a Discord or Slack webhook address. OFFSIDE_NTFY = a topic name on ntfy.sh (free phone push).
     Text message: TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM and OFFSIDE_SMS_TO."""
@@ -1094,7 +1432,7 @@ def notify(title, message, click="", post=None, sms=None, problems=None):
         if click: body["click"] = click; body["actions"] = [{"action": "view", "label": "Open live prices", "url": click}]
         sent += attempt("phone alert", lambda: post("https://ntfy.sh/", body))
     hook = (env("OFFSIDE_WEBHOOK") or "").strip().strip('"')
-    if hook:
+    if hook and (discord or "discord" not in hook):
         text = ("**%s**\n%s%s" % (title, message, ("\n" + click) if click else ""))[:1900]
         payload = {"content": text} if "discord" in hook else {"content": text, "text": text}
         sent += attempt("chat alert", lambda: post(hook, payload))
@@ -1106,7 +1444,7 @@ def notify(title, message, click="", post=None, sms=None, problems=None):
 class Engine:
     def __init__(self, odds_key=None, ctx_key=None, interval=600, regions="uk,eu", horizon_h=72, now_fn=time.time,
                  odds_fn=None, scores_fn=None, scrape_fn=None, result_fn=None, news_fn=None, verify_fn=None, shot_fn=None, persist=True,
-                 in_play=False, confirm_fn=None, alert_fn=None):
+                 in_play=False, confirm_fn=None, alert_fn=None, card_fn=None, result_card_fn=None):
         self.odds_key, self.ctx_key, self.interval, self.regions = odds_key, ctx_key, interval, regions
         self.horizon, self.now, self.persist = horizon_h * 3600, now_fn, persist
         self.odds_fn = odds_fn or (lambda lg: api_get("/sports/%s/odds" % lg, {"regions": self.regions, "markets": "h2h",
@@ -1118,11 +1456,13 @@ class Engine:
             known = lambda url: url in self.last_good or any(w["url"] == url and w.get("home") and w.get("away") and w.get("kickoff") for w in self.watch)
             self.read_page = lambda url: ctx_read_odds(self.ctx_key, url, light=known(url))
         self.research = (lambda home, away: ctx_research_odds(self.ctx_key, home, away))
-        raw = confirm_fn or ((lambda book, home, away, price, outcome: ctx_confirm_at_source(self.ctx_key, book, home, away, price, outcome))
-                             if (ctx_key and not scrape_fn) else (lambda book, home, away, price, outcome: ("seen", "", "", price)))
-        def confirm(book, home, away, price, outcome="home"):
-            try: out = raw(book, home, away, price, outcome)
-            except TypeError: out = raw(book, home, away, price)        # older four-argument form
+        raw = confirm_fn or ((lambda book, home, away, price, outcome, page="": ctx_confirm_at_source(self.ctx_key, book, home, away, price, outcome, known=page))
+                             if (ctx_key and not scrape_fn) else (lambda book, home, away, price, outcome, page="": ("seen", "", "", price)))
+        def confirm(book, home, away, price, outcome="home", page=""):
+            try: out = raw(book, home, away, price, outcome, page)
+            except TypeError:
+                try: out = raw(book, home, away, price, outcome)
+                except TypeError: out = raw(book, home, away, price)    # older four-argument form
             out = tuple(out) + (None,) * 4
             return out[0], out[1], out[2], out[3]
         self.confirm = confirm
@@ -1140,10 +1480,22 @@ class Engine:
         self.in_play, self.failed, self.hist, self.last_real_read = in_play, set(), {}, None
         self.feed, self.wake = [], threading.Event()
         self.force_settle = False
+        self.finding, self.find_every = {}, 0
         self.prefetch, self.reading, self.read_note = {}, set(), {}
-        self.alert = alert_fn or (lambda title, message, click: threading.Thread(target=notify, args=(title, message, click), daemon=True).start())
+        # Discord gets one card per flagged price, edited in place; every other channel gets short text alerts
+        self.alert = alert_fn or (lambda title, message, click: threading.Thread(target=notify, args=(title, message, click),
+                                                                                 kwargs={"discord": False}, daemon=True).start())
+        def default_card(payload, message_id):
+            hook = (os.environ.get("OFFSIDE_WEBHOOK") or "").strip().strip('"')
+            return discord_card(hook, payload, message_id) if "discord" in hook else None
+        self.card_fn = card_fn or default_card
+        self.cards, self.card_lock, self.card_warned = {}, threading.Lock(), False
+        self.paced = {}
+        self.result_card = result_card_fn or (lambda payload: discord_card(results_hook(), payload) if results_hook() else None)
+        self.public = False
         self.pot_start, self.stake_pct = 1000.0, 2.0
         self.alert_min = 3                                         # alert on flags that pass at least this setting (3 = all)
+        self.window_h = 48                                         # only matches kicking off within this many hours are flagged (0 = no limit)
         self.parallel = 6                                          # pages read side by side
         self.bg = (lambda fn: fn()) if (scrape_fn or odds_fn) else (lambda fn: threading.Thread(target=fn, daemon=True).start())
         self.stats = {"pages": 0, "prices": 0, "screenshots": 0, "news": 0, "since": self.now()}
@@ -1159,6 +1511,11 @@ class Engine:
         """Pick up where the last run stopped: the last prices read, flags waiting for their second read, counters."""
         st = load("state.json", {})
         self.stats = dict(self.stats, **(st.get("stats") or {}))
+        if not self.stats.get("ctx"):                                  # first run with these counts: start from the totals already kept
+            self.stats["ctx"] = {"prices": int(self.stats.get("pages") or 0), "screenshot": int(self.stats.get("screenshots") or 0), "answers": int(self.stats.get("news") or 0)}
+        for k_, v_ in (self.stats.get("ctx") or {}).items():           # carry the Context.dev call counts across restarts
+            if k_ == "since": CTX_CALLS["since"] = CTX_CALLS["since"] or v_
+            elif isinstance(v_, int) and k_ in CTX_CALLS: CTX_CALLS[k_] = max(CTX_CALLS[k_], v_)
         self.missed = st.get("missed") or []
         self.hist = st.get("hist") or {}
         self.seen = st.get("seen") or {}
@@ -1204,10 +1561,13 @@ class Engine:
             if any(re.search(r" \([A-Z0-9]{2,3}\)$", k) for k in m["books"]):
                 continue                                           # read while bookmaker names were out of step: read it again
             self.last_good[url] = {"t": g.get("t", 0), "m": m}
+        for row in st.get("cards") or []:                            # the Discord message for each recent flag, so it can still be edited
+            try: self.cards[tuple(row["key"])] = {"id": row.get("id"), "d": row.get("d") or {}}
+            except Exception: pass
         for row in st.get("pending") or []:
             k = tuple(row["key"])
             if row.get("recorded") or self.now() - row.get("first_seen", 0) < 20 * 60:
-                self.pending[k] = {x: row[x] for x in row if x != "key"}
+                self.pending[k] = {x: row[x] for x in row if x not in ("key", "checking")}
         rows = []
         for url, g in self.last_good.items():                      # show the last known prices straight away
             m = g["m"]
@@ -1219,21 +1579,23 @@ class Engine:
         self.matches = sorted(rows, key=lambda s: (s["kickoff"] or 9e18))
         if rows: self.last_read = max(g["t"] for g in self.last_good.values())
 
-    def _sight(self, match, book, outcome, price, average, points, t, kickoff=None):
+    def _sight(self, match, book, outcome, price, average, points, t, kickoff=None, url=""):
         k = "%s|%s|%s" % (match, book, outcome)
         s = self.seen.get(k)
         if s and t - s["last"] < 1800:
-            s["last"] = t; s["reads"] += 1
+            s["last"] = t; s["reads"] += 1; s.pop("end", None)
             if price > s["price"]: s["price"], s["average"] = price, average
             s["points"] = max(s["points"], points)
         else:
             self.seen[k] = {"match": match, "book": book, "outcome": outcome, "price": price, "average": average, "points": points,
-                            "first": t, "last": t, "reads": 1, "kickoff": kickoff}
+                            "first": t, "last": t, "reads": 1, "kickoff": kickoff, "url": url or ""}
 
     def _remember(self):
         if not self.persist: return
+        self.stats["ctx"] = dict(CTX_CALLS)
         save("state.json", {"stats": self.stats, "missed": self.missed[-200:], "hist": self.hist, "seen": self.seen,
                             "pending": [dict({x: y for x, y in v.items() if x != "source"}, key=list(k)) for k, v in self.pending.items()],
+                            "cards": [{"key": list(k), "id": c.get("id"), "d": c.get("d")} for k, c in list(self.cards.items())[-120:] if c.get("id")],
                             "last_good": {u: {"t": g["t"], "m": {x: g["m"][x] for x in g["m"] if x != "proof"}} for u, g in self.last_good.items()}})
 
     def _verify(self, link, price):
@@ -1445,9 +1807,13 @@ class Engine:
         already = {(r["mid"], r["book"], r["outcome"]) for r in self.record}
         taken = {(r["mid"], r["outcome"]) for r in self.record}
         fresh_rows = []
+        early_ids = set()
         for m in self._gather():
             res = scan.analyse(m["books"]); near = nearest(m["books"])
             playing = bool(m["kickoff"] and self.now() > m["kickoff"])
+            early = bool(self.window_h and m["kickoff"] and m["kickoff"] - self.now() > self.window_h * 3600)
+            if early: early_ids.add(m["id"])
+            flagged = [] if (early or not res) else res["flags"]     # too far from kick-off: watched, but nothing is flagged yet
             if res and not m.get("stale"):
                 h = self.hist.setdefault(m["id"], [])
                 h.append([round(self.now())] + [round(x, 3) for x in res["avg"]] + [round(x, 3) for x in res["best"]])
@@ -1455,7 +1821,7 @@ class Engine:
             oi = {"home": 0, "draw": 1, "away": 2}.get((near or {}).get("outcome"), 0)
             summary.append({"id": m["id"], "home": m["home"], "away": m["away"], "kickoff": m["kickoff"], "scope": m["scope"],
                             "league": m["league_title"], "books": len(m["books"]), "avg": res["avg"] if res else None,
-                            "nearest": near, "flags": len(res["flags"]) if res else 0, "stale": m.get("stale"), "in_play": playing,
+                            "nearest": near, "flags": len(flagged), "early": early, "stale": m.get("stale"), "in_play": playing,
                             "read_t": m.get("stale") or self.now(), "url": m.get("url") or "",
                             "hist": [[x[0], x[1 + oi], x[4 + oi]] for x in self.hist.get(m["id"], [])]})
             if m.get("stale"):
@@ -1464,29 +1830,42 @@ class Engine:
             self.stats["pages"] += 1; self.stats["prices"] += 3 * len(m["books"])
             fresh_rows.append({"t": round(self.now()), "match": "%s v %s" % (m["home"], m["away"]), "kickoff": m["kickoff"], "books": len(m["books"]),
                                "avg": res["avg"] if res else None, "best": res["best"] if res else None,
-                               "flags": [[f["book"], f["outcome"], f["price"], f["points"]] for f in (res["flags"] if res else [])],
+                               "flags": [[f["book"], f["outcome"], f["price"], f["points"]] for f in flagged],
                                "prices": {k: list(v) for k, v in m["books"].items()}})
-            for f in (res["flags"] if res else []):
-                self._sight("%s v %s" % (m["home"], m["away"]), f["book"], f["outcome"], f["price"], f["average"], f["points"], self.now(), m["kickoff"])
+            for f in flagged:
+                self._sight("%s v %s" % (m["home"], m["away"]), f["book"], f["outcome"], f["price"], f["average"], f["points"], self.now(), m["kickoff"], m.get("url") or "")
                 k = (m["id"], f["book"], f["outcome"]); seen_now.add(k)
-                entry = dict(f, mid=m["id"], url=m["url"], league=m["league"], league_title=m["league_title"], home=m["home"],
+                fd = (((READ_META.get(m["url"]) or {}).get("feed") or {}).get(f["book"]) or {}).get(f["outcome"]) or {}
+                entry = dict(f, feed_t=fd.get("t"), sel=fd.get("sel") or "", mid=m["id"], url=m["url"], league=m["league"], league_title=m["league_title"], home=m["home"],
                              away=m["away"], kickoff=m["kickoff"], scope=m["scope"], link=(m.get("links") or {}).get(f["book"], ""),
                              in_play=playing)
                 if k in already and k not in self.pending:
                     self.pending[k] = {"first_seen": self.now(), "recorded": True}
                 if k in self.pending:
                     entry["status"] = "confirmed"; entry["first_seen"] = self.pending[k]["first_seen"]
+                    entry["avg0"] = self.pending[k].get("avg0")
+                    if k not in self.cards and not self.pending[k].get("recorded") and f["points"] >= self.alert_min:   # its card was lost: start a new one
+                        self.cards[k] = {"id": None, "d": {"home": m["home"], "away": m["away"], "book": f["book"], "outcome": f["outcome"], "price": f["price"],
+                                                            "average": entry["avg0"] or f["average"], "kickoff": m["kickoff"], "odds_url": m["url"] or "",
+                                                            "site": book_site(f["book"]), "league_page": book_page_for(f["book"], m["url"]),
+                                                            "t_seen": self.pending[k]["first_seen"], "feed_t": entry.get("feed_t")}}
                     if not self.pending[k].get("recorded"):
                         if k not in already and (m["id"], f["outcome"]) not in taken:
                             taken.add((m["id"], f["outcome"]))
                             self._record(entry, m["proof"])
                             print("  %s  RECORDED: %s v %s, %s %s at %.2f (average %.2f)" % (time.strftime("%H:%M:%S"), m["home"], m["away"],
                                                                                            f["book"], f["outcome"], f["price"], f["average"]))
+                            if k in self.cards:
+                                src_ = self.pending[k].get("source")
+                                self._card(k, stage="confirmed", record="added", average_now=f["average"], **({"source": [src_[0], src_[1], (list(src_) + [None] * 4)[3]]} if src_ else {}))
+                        elif k in self.cards:
+                            other = next((r for r in self.record if r["mid"] == m["id"] and r["outcome"] == f["outcome"]), None)
+                            self._card(k, stage="confirmed", record="already", average_now=f["average"], had=(other["book"], other["price"]) if other else None)
                         self.pending[k]["recorded"] = True
                     entry["news"] = self.pending[k].get("news", ""); entry["verify"] = self.pending[k].get("verify", "")
                 else:
                     entry["status"] = "checking"; entry["first_seen"] = self.now(); entry["news"] = ""; entry["verify"] = ""
-                    self.pending[k] = {"first_seen": self.now(), "match": "%s v %s" % (m["home"], m["away"]), "price": f["price"]}
+                    self.pending[k] = {"first_seen": self.now(), "match": "%s v %s" % (m["home"], m["away"]), "price": f["price"], "avg0": f["average"]}
                     if k not in already and f["points"] >= self.alert_min:   # first sighting: tell the phone straight away
                         who = {"home": m["home"] + " to win", "draw": "The draw", "away": m["away"] + " to win"}[f["outcome"]]
                         had = next((r for r in self.record if r["mid"] == m["id"] and r["outcome"] == f["outcome"]), None)
@@ -1498,31 +1877,37 @@ class Engine:
                                            time.strftime("%a %H:%M", time.localtime(m["kickoff"])) if m["kickoff"] else "time unknown", f["book"],
                                            {"home": m["home"], "draw": "Draw", "away": m["away"]}[f["outcome"]],
                                            (" This result is already in the record at %.2f with %s, so it will not be added a second time." % (had["price"], had["book"])) if had else ""),
-                                       m["url"] or "")
+                                       book_page_for(f["book"], m["url"]) or book_site(f["book"]) or m["url"] or "")
                         except Exception:
                             pass
+                        self.cards[k] = {"id": None, "d": {}}
+                        self._card(k, home=m["home"], away=m["away"], book=f["book"], outcome=f["outcome"], price=f["price"], average=f["average"],
+                                   kickoff=m["kickoff"], odds_url=m["url"] or "", site=book_site(f["book"]), league_page=book_page_for(f["book"], m["url"]),
+                                   t_seen=self.now(), stage="seen", feed_t=entry.get("feed_t"),
+                                   had=(had["book"], had["price"]) if had else None)
                         if m["url"]:                                  # meanwhile, look for the bookmaker's own page for this match
-                            def follow(k=k, book=f["book"], home=m["home"], away=m["away"], price=f["price"], who=who, outcome=f["outcome"]):
-                                try:
-                                    status, link, text, there = self.confirm(book, home, away, price, outcome)
-                                except Exception:
-                                    return
-                                if k in self.pending: self.pending[k]["source"] = [status, link, (text or "")[:30000], there]
-                                sk = "%s v %s|%s|%s" % (home, away, book, outcome)
-                                if sk in self.seen: self.seen[sk].update(verify=status, book_link=link or "", book_price=there)
-                                if link:
-                                    self.alert("Bet at %s: %s v %s" % (book, home, away),
-                                               "%s. %s" % (who, "The same price, %.2f, is showing on %s's own site. This link goes straight to the match there." % (price, book)
-                                                           if status == "seen" else
-                                                           "%s's own site is showing %.2f now (the comparison site had %.2f). This link goes straight to the match there." % (book, there, price)
-                                                           if status == "moved" else
-                                                           "This is %s's own page for the match. Check the price there before betting." % book), link)
-                            self.bg(follow)
+                            self.pending[k]["checking"] = True
+                            self.bg(lambda k=k, book=f["book"], home=m["home"], away=m["away"], price=f["price"], outcome=f["outcome"], odds_page=m["url"]:
+                                    self._check_book(k, book, home, away, price, outcome, odds_page, announce=True))
                 live.append(entry)
+        for k in [k for k in self.pending if k[0] in early_ids]:      # outside the window now: dropped quietly, it is not a price that went away
+            gone = self.pending.pop(k)
+            if not gone.get("recorded") and k in self.cards:
+                self._card(k, stage="gone", why="Kick-off is more than %d hours away, so it is not counted yet." % self.window_h)
         for k in [k for k in self.pending if k not in seen_now and k[0] not in self.unread]:
             gone = self.pending.pop(k)                             # back in line (or kicked off) before confirmation
             if not gone.get("recorded") and gone.get("match"):
                 self.missed.append({"t": self.now(), "match": gone["match"], "book": k[1], "outcome": k[2], "price": gone.get("price")})
+                why = self._why_gone(k, gone)
+                sk = "%s|%s|%s" % (gone["match"], k[1], k[2])
+                if sk in self.seen: self.seen[sk]["end"] = why
+                text = {"caught": "The other bookmakers moved towards %s's price, so at %.2f it is no longer out of line." % (k[1], why.get("price_now") or 0),
+                        "cut": "%s has cut the price to %.2f." % (k[1], why.get("price_now") or 0),
+                        "removed": "%s is no longer offering a price." % k[1],
+                        "kickoff": "The match has kicked off."}.get(why["why"], "It was not out of line on the next read.")
+                if k in self.cards: self._card(k, stage="gone", why=text)
+                try: self.alert("No longer out of line: %s" % gone["match"], "%s at %.2f. %s It was not added to the record." % (k[1], gone.get("price") or 0, text), "")
+                except Exception: pass
         if self.persist and fresh_rows:
             try:
                 os.makedirs(DATA, exist_ok=True)
@@ -1530,6 +1915,17 @@ class Engine:
                     for row in fresh_rows: f.write(json.dumps(row) + "\n")
             except Exception:
                 pass
+        started = 0
+        for e_ in live:
+            k = (e_["mid"], e_["book"], e_["outcome"]); p_ = self.pending.get(k)
+            if not p_ or not e_.get("url") or p_.get("checking") or started >= 3:
+                continue
+            src, last = p_.get("source"), p_.get("checked_at") or 0
+            ok = bool(src) and src[0] in ("seen", "moved")
+            wait = 900 if ok else (300 if book_page_for(e_["book"], e_["url"]) else 1800)
+            if (src is None and not last) or self.now() - last >= wait:
+                p_["checking"] = True; started += 1
+                self.bg(lambda k=k, e_=e_: self._check_book(k, e_["book"], e_["home"], e_["away"], e_["price"], e_["outcome"], e_["url"]))
         with self.lock:
             self.live = sorted(live, key=lambda e: (e["kickoff"] or 9e18, -e["edge_pct"]))
             self.matches = sorted(summary, key=lambda s: (s["kickoff"] or 9e18))
@@ -1546,7 +1942,8 @@ class Engine:
             if done:
                 verify, source_link, page, source_price = (list(done) + [None] * 4)[:4]
             else:
-                try: verify, source_link, page, source_price = self.confirm(entry["book"], entry["home"], entry["away"], entry["price"], entry["outcome"])
+                try: verify, source_link, page, source_price = self.confirm(entry["book"], entry["home"], entry["away"], entry["price"], entry["outcome"],
+                                                                            book_page_for(entry["book"], entry["url"]))
                 except Exception: verify, source_link, page = "unreadable", "", ""
         else:
             try: verify, page = self.verify(entry.get("link") or "", entry["price"])
@@ -1568,16 +1965,19 @@ class Engine:
             except Exception:
                 shot = ""
             with open(os.path.join(DATA, "proofs", proof), "w", encoding="utf-8") as f:
-                f.write("Recorded %s\n%s v %s\n%s %s at %.2f (average %.2f)\nContext.dev request id for this read: %s\n\n%s" % (
+                f.write("Recorded %s\n%s v %s\n%s %s at %.2f (average %.2f)\nContext.dev request id for this read: %s\n%s%s\n%s" % (
                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.now())), entry["home"], entry["away"],
                     entry["book"], entry["outcome"], entry["price"], entry["average"],
-                    (READ_META.get(entry["url"]) or {}).get("request_id", "not available"), proof_text))
+                    (READ_META.get(entry["url"]) or {}).get("request_id", "not available"),
+                    ("The odds site last had a price change from %s at %s\n" % (entry["book"], time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry["feed_t"])))) if entry.get("feed_t") else "",
+                    ("%s's own id for this selection, from the odds site: %s\n" % (entry["book"], entry["sel"])) if entry.get("sel") else "", proof_text))
         rec = {"id": rid, "t": self.now(), "mid": entry["mid"], "league": entry["league"], "league_title": entry["league_title"],
                "url": entry["url"], "home": entry["home"], "away": entry["away"], "kickoff": entry["kickoff"], "scope": entry["scope"],
                "book": entry["book"], "outcome": entry["outcome"], "price": entry["price"], "average": entry["average"],
                "needed": entry["needed"], "points": entry["points"], "edge_pct": entry["edge_pct"], "proof": proof, "shot": shot,
                "verify": verify, "link": entry.get("link") or source_link or entry["url"], "in_play": bool(entry.get("in_play")),
                "request_id": (READ_META.get(entry["url"]) or {}).get("request_id", ""), "source_price": source_price,
+               "feed_t": entry.get("feed_t"), "sel": entry.get("sel") or "",
                "news": "", "news_url": "", "result": None, "score": "", "profit": None, "checked": 0}
         if shot: self.stats["screenshots"] += 1
         if entry["home"]:
@@ -1630,8 +2030,36 @@ class Engine:
             with self.lock: self._save("record.json", self.record)
 
     # ----- settle finished matches
+    def _post_results(self):
+        """Post a card for every finished match that has not had one yet, oldest first, each with the record as it stood then."""
+        done = sorted((r for r in self.record if r["result"] is not None), key=lambda r: (r.get("kickoff") or r["t"], r["t"]))
+        tag = results_tag()
+        # posted already? With a results channel set, only a post to that channel counts, so results sent elsewhere earlier are sent again there.
+        posted = lambda r: (r.get("result_posted") == tag) if tag else bool(r.get("result_posted"))
+        if all(posted(r) for r in done):
+            return
+        bank, finished, won = self.pot_start, 0, 0
+        todo = []
+        for r in done:
+            finished += 1; won += 1 if r["result"] == "won" else 0
+            bank += (r.get("stake") or 0.0) * (r.get("profit") or 0.0)
+            if not posted(r):
+                todo.append((r, {"finished": finished, "won": won, "bank": round(bank, 2), "start": self.pot_start}))
+        def go():
+            for r, tally in todo[:6]:
+                try:
+                    if self.result_card(result_payload(r, tally)) is None:
+                        return                                         # nowhere to post yet: try again when a webhook is set
+                    r["result_posted"] = tag or True
+                except Exception as e:
+                    print("  result card not sent: %s" % str(e)[:160]); return
+            with self.lock: self._save("record.json", self.record)
+        self.bg(go)
+
     def settle(self):
         try: self._closing()
+        except Exception: pass
+        try: self._post_results()
         except Exception: pass
         early = 100 if self.force_settle else 112
         self.force_settle = False
@@ -1672,8 +2100,82 @@ class Engine:
             changed = True
         if changed:
             with self.lock: self._save("record.json", self.record)
+            try: self._post_results()
+            except Exception: pass
 
     # ----- what the dashboard shows
+    def _card(self, k, **changes):
+        """Create or update the Discord card for one flagged price."""
+        c = self.cards.setdefault(k, {"id": None, "d": {}})
+        c["d"].update(changes)
+        if self.persist:
+            try: self._remember()
+            except Exception: pass
+        if "home" not in c["d"]:
+            return
+        def go():
+            with self.card_lock:
+                try:
+                    c["id"] = self.card_fn(card_payload(c["d"]), c["id"]) or c["id"]
+                except Exception as e:
+                    if not self.card_warned:
+                        self.card_warned = True
+                        print("  Discord card not sent: %s" % str(e)[:200])
+        self.bg(go)
+        for old in list(self.cards)[:-300]: self.cards.pop(old, None)
+
+    def _check_book(self, k, book, home, away, price, outcome, odds_page, announce=False):
+        """Look for the price on the bookmaker's own site and note what it shows there. This runs at the first sighting and
+        again every so often while the price stays out of line, so a price that could not be checked at first still gets its answer."""
+        try:
+            status, link, text, there = self.confirm(book, home, away, price, outcome, book_page_for(book, odds_page))
+        except Exception:
+            status, link, text, there = "unreadable", "", "", None
+        now, good = self.now(), status in ("seen", "moved")
+        p_ = self.pending.get(k)
+        if p_ is not None:
+            p_["checking"] = False; p_["checked_at"] = now
+            if good or (p_.get("source") or [None])[0] not in ("seen", "moved"):      # a later failed read never hides an earlier answer
+                p_["source"] = [status, link, (text or "")[:30000], there]; p_["verify"] = status
+        sk = "%s v %s|%s|%s" % (home, away, book, outcome)
+        if sk in self.seen and (good or self.seen[sk].get("verify") not in ("seen", "moved")):
+            self.seen[sk].update(verify=status, book_link=link or "", book_price=there, book_t=now)
+        rec = next((r for r in self.record if r["mid"] == k[0] and r["book"] == book and r["outcome"] == outcome), None)
+        if rec is not None and good and rec.get("verify") not in ("seen", "moved"):   # the record gains the answer, with the time it was checked
+            rec.update(verify=status, source_price=there, verify_t=now)
+            if link: rec["link"] = link
+            with self.lock: self._save("record.json", self.record)
+        elif rec is not None and not good and status != "unreadable" and rec.get("verify") in ("unreadable", "not listed", "no page", "blocked", "", None):
+            rec.update(verify=status, verify_t=now)                    # still no answer, but the record says why
+            with self.lock: self._save("record.json", self.record)
+        if k in self.cards and (good or (self.cards[k]["d"].get("source") or [None])[0] not in ("seen", "moved")):
+            self._card(k, source=[status, link or "", there])
+        if announce and link:
+            who = {"home": home + " to win", "draw": "The draw", "away": away + " to win"}[outcome]
+            self.alert("Bet at %s: %s v %s" % (book, home, away),
+                       "%s. %s" % (who, "The same price, %.2f, is showing on %s's own site." % (price, book) if status == "seen" else
+                                   "%s's own site is showing %.2f now (the comparison site had %.2f)." % (book, there, price) if status == "moved" else
+                                   "This is %s's own page for the match. Check the price there before betting." % book), link)
+
+    def _why_gone(self, k, gone):
+        """What changed between the read that flagged a price and the next one, a minute later."""
+        url = k[0][5:] if str(k[0]).startswith("page:") else ""
+        w = next((x for x in self.watch if x["url"] == url), None)
+        if w and w.get("kickoff") and self.now() > w["kickoff"]:
+            return {"why": "kickoff"}
+        g = self.last_good.get(url)
+        if not g:
+            return {"why": "unknown"}
+        books = g["m"]["books"]; i = {"home": 0, "draw": 1, "away": 2}[k[2]]
+        now_price = (books.get(k[1]) or (None, None, None))[i]
+        avg = sum(b[i] for b in books.values()) / float(len(books)); chance = 1.0 / avg - min(scan.ALPHAS)
+        need = round(1.0 / chance, 3) if chance > 0.02 else None
+        if now_price is None:
+            return {"why": "removed"}
+        if gone.get("price") and now_price < gone["price"] * 0.995:
+            return {"why": "cut", "price_now": now_price, "needed_now": need}
+        return {"why": "caught", "price_now": now_price, "needed_now": need}
+
     def _field(self, e):
         """Every bookmaker's price for the result a live row is about, lowest first."""
         g = self.last_good.get(e.get("url") or "")
@@ -1696,14 +2198,22 @@ class Engine:
         return e
 
     def _book_page(self, e):
-        """What is known about the bookmaker's own page for a live row: its address, what the check found, the price there."""
+        """What is known about a live row: whether it is in the record, and the bookmaker's own page (address, what the check found, the price there)."""
+        out = self._book_page_only(e)
+        other = next((r for r in self.record if r["mid"] == e["mid"] and r["outcome"] == e["outcome"] and r["book"] != e["book"]), None)
+        out["in_record"] = any(r["mid"] == e["mid"] and r["book"] == e["book"] and r["outcome"] == e["outcome"] for r in self.record)
+        out["backed"] = {"book": other["book"], "price": other["price"]} if (other and not out["in_record"]) else None
+        return out
+
+    def _book_page_only(self, e):
+        p_ = self.pending.get((e["mid"], e["book"], e["outcome"])) or {}
+        src = p_.get("source")
+        if src and (src[1] or src[0] in ("seen", "moved")):          # the latest check while the price is out of line
+            return {"book_link": src[1] or "", "verify": src[0], "book_price": (list(src) + [None] * 4)[3], "book_t": p_.get("checked_at")}
         rec = next((r for r in self.record if r["mid"] == e["mid"] and r["book"] == e["book"] and r["outcome"] == e["outcome"]), None)
         if rec and rec.get("verify") in ("seen", "moved", "not shown") and str(rec.get("link") or "").startswith("http") and rec.get("link") != rec.get("url"):
-            return {"book_link": rec["link"], "verify": rec["verify"], "book_price": rec.get("source_price")}
-        src = (self.pending.get((e["mid"], e["book"], e["outcome"])) or {}).get("source")
-        if src and src[1]:
-            return {"book_link": src[1], "verify": src[0], "book_price": (list(src) + [None] * 4)[3]}
-        return {"book_link": "", "book_price": None}
+            return {"book_link": rec["link"], "verify": rec["verify"], "book_price": rec.get("source_price"), "book_t": rec.get("verify_t")}
+        return {"book_link": "", "book_price": None, "book_t": None}
 
     def state(self):
         with self.lock:
@@ -1712,13 +2222,17 @@ class Engine:
             closed = [r for r in self.record if r.get("close_avg")]
             return {"now": self.now(), "interval": self.interval, "last_read": self.last_real_read or self.last_read, "quota": self.quota,
                     "in_play_mode": self.in_play,
-                    "stats": dict(self.stats, credits=CREDITS.get("left")), "missed": len(self.missed), "backlog": self.backlog,
-                    "feed": list(reversed(self.feed))[:14], "pot": self.pot(), "version": VERSION,
+                    "stats": dict(self.stats, credits=CREDITS.get("left"), ctx=dict(CTX_CALLS)), "missed": len(self.missed), "backlog": self.backlog,
+                    "public": bool(getattr(self, "public", False)),
+                    "feed": list(reversed(self.feed))[:14], "pot": self.pot(), "version": VERSION, "book_sites": BOOK_SITES, "book_pages": book_pages(), "window_h": self.window_h,
+                    "brands": {k: {"icon": v["icon"], "bg": v.get("bg") or ""} for k, v in brands().items() if v.get("icon")}, "finding": dict(self.finding, every=self.find_every),
+                    "invite": (lambda u: u if re.match(r"https://(discord\.gg|discord\.com/invite)/[\w-]+$", u) else "")((os.environ.get("OFFSIDE_DISCORD_INVITE") or "").strip().strip('"')),
                     "read_note": {k: v for k, v in self.read_note.items() if self.now() - v["t"] < 180},
-                    "alerts": {"ntfy": os.environ.get("OFFSIDE_NTFY") or "", "webhook": bool(os.environ.get("OFFSIDE_WEBHOOK")),
+                    "alerts": {"ntfy": "" if getattr(self, "public", False) else (os.environ.get("OFFSIDE_NTFY") or ""), "webhook": bool(os.environ.get("OFFSIDE_WEBHOOK")),
                                "sms": (os.environ.get("OFFSIDE_SMS_TO") or "")[-4:] if os.environ.get("TWILIO_SID") else ""},
-                    "checks": {v: sum(1 for r in self.record if (r.get("verify") or "") == v) for v in ("seen", "moved", "not shown", "unreadable")},
-                    "seen": sorted(({**s, "recorded": any(r["book"] == s["book"] and r["outcome"] == s["outcome"] and "%s v %s" % (r["home"], r["away"]) == s["match"]
+                    "checks": dict({v: sum(1 for r in self.record if (r.get("verify") or "") == v) for v in ("seen", "moved", "not shown")},
+                                   unreadable=sum(1 for r in self.record if (r.get("verify") or "") in ("unreadable", "not listed", "no page", "blocked"))),
+                    "seen": sorted(({**s, "early": bool(self.window_h and s.get("kickoff") and s["kickoff"] - s["first"] > self.window_h * 3600), "recorded": any(r["book"] == s["book"] and r["outcome"] == s["outcome"] and "%s v %s" % (r["home"], r["away"]) == s["match"]
                                                           for r in self.record),
                                      "backed": next(({"book": r["book"], "price": r["price"]} for r in self.record
                                                      if r["outcome"] == s["outcome"] and "%s v %s" % (r["home"], r["away"]) == s["match"] and r["book"] != s["book"]), None)}
@@ -1829,38 +2343,41 @@ def readme_block(ev):
          "with no betting exchanges. The rule and its settings were published in 2017 using data up to 2015. Every match in this test was played "
          "after that, so the rule could not have been fitted to it." % ("{:,}".format(ev.get("matches", 0)), ev.get("leagues", 0), month(ev.get("first")), month(ev.get("last")), yrs), "",
          "**The return is per bet, on the money staked each time. It is not a yearly figure and it is not the return over the whole period.** "
-         "A bet settles in about two hours, so the same money is staked again and again. The table shows the same result in every form.", ""]
+         "A bet settles in about two hours, so the same money is staked again and again.", ""]
     m = S.get("4")
     if m and bank(m).get("total") is not None:
         L += ["At the medium setting the rule returned **%s on every bet** over %s bets. Staking £20 a bet from a £1,000 bank, that is %s in total, "
               "an average of **%+d%% a year** on the bank%s." % (pc(m["roi"]), "{:,}".format(m["bets"]), gbp(bank(m)["total"]), round(bank(m)["per_year_pct"]),
                                                                 (", with %d winning seasons out of %d" % (m["winning_seasons"], m["n_seasons"])) if m.get("winning_seasons") is not None else ""), ""]
-    L += [
-         "| | " + " | ".join(title[k] for k in keys) + " |", "|---|" + "---|" * len(keys),
-         row("**Return on every bet**, on the money staked", lambda s: "**%s**" % pc(s["roi"])),
-         row("Bets in the test", lambda s: "{:,}".format(s["bets"])),
-         row("Bets a year", lambda s: "about %d" % round(s["bets"] / yrs)),
-         row("Total profit, staking 1 unit a bet", lambda s: "%s units" % signed(units(s))),
-         row("Total profit at £100 a bet", lambda s: gbp(units(s) * 100)),
-         row("Profit a year at £100 a bet", lambda s: "about " + gbp(units(s) * 100 / yrs)),
-         row("A £1,000 bank staking £20 a bet: total profit", lambda s: gbp(bank(s).get("total"))),
-         row("The same bank: **average return a year**", lambda s: None if bank(s).get("per_year_pct") is None else "**%+d%%**" % round(bank(s)["per_year_pct"])),
-         row("The same bank: worst season", lambda s: gbp(bank(s).get("worst_season"))),
-         row("Seasons that made money", lambda s: None if s.get("winning_seasons") is None else "%d of %d" % (s["winning_seasons"], s["n_seasons"])),
-         row("t statistic (above 2 is unlikely to be luck)", lambda s: None if s.get("t") is None else "%.2f" % s["t"]),
-         row("Per bet, seasons before %s" % sp, lambda s: pc(s.get("older_roi"))),
-         row("Per bet, seasons from %s" % sp, lambda s: pc(s.get("newer_roi"))), ""]
+    def safe(fn, s):
+        try: v = fn(s)
+        except Exception: v = None
+        return todo if v is None else v
+    L += ["| Setting | Return on every bet | Bets a year | Profit on a £1,000 bank, £20 a bet | Average a year on the bank | Worst season |", "|---|---|---|---|---|---|"]
+    for k in keys:
+        s = S[k]
+        L.append("| %s | %s | %s | %s | %s | %s |" % (
+            title[k], safe(lambda s: "**%s**" % pc(s["roi"]), s), safe(lambda s: "about %d" % round(s["bets"] / yrs), s), safe(lambda s: gbp(bank(s).get("total")), s),
+            safe(lambda s: None if bank(s).get("per_year_pct") is None else "**%+d%%**" % round(bank(s)["per_year_pct"]), s), safe(lambda s: gbp(bank(s).get("worst_season")), s)))
+    L += [""]
     if ev.get("baseline_roi") is not None:
-        L += ["For comparison, betting every result at the average price over the same matches returned %s per bet. That is the bookmakers' margin. "
+        L += ["Betting every result at the average price over the same matches returned %s per bet. That is the bookmakers' margin. "
               "A return of 2%% to 5%% per bet is usually thought of as a good long-run result for a professional." % pc(ev["baseline_roi"]), ""]
-    L += ["How to read it:", "",
-          "- The looser the setting, the more often it bets and the thinner the edge on each bet. The stricter settings bet rarely, at a higher return per bet.",
-          "- The bank rows use flat stakes with no compounding. They assume the recorded price was available every time and the account was never limited. "
-          "Bookmakers do limit accounts that win this way, so capacity is the practical ceiling, not the edge.",
-          "- A single season has few bets, so one season on its own proves little. The totals are the evidence.", ""]
+    L += ["The bank figures use flat stakes with no compounding. They assume the recorded price was available every time and the account was never limited. "
+          "Bookmakers do limit accounts that win this way, so capacity is the practical ceiling, not the edge.", "",
+          "<details>", "<summary>More detail: totals, significance and season by season</summary>", "",
+          "| | " + " | ".join(title[k] for k in keys) + " |", "|---|" + "---|" * len(keys),
+          row("Bets in the test", lambda s: "{:,}".format(s["bets"])),
+          row("Total profit, staking 1 unit a bet", lambda s: "%s units" % signed(units(s))),
+          row("Total profit at £100 a bet", lambda s: gbp(units(s) * 100)),
+          row("Profit a year at £100 a bet", lambda s: "about " + gbp(units(s) * 100 / yrs)),
+          row("Seasons that made money", lambda s: None if s.get("winning_seasons") is None else "%d of %d" % (s["winning_seasons"], s["n_seasons"])),
+          row("t statistic (above 2 is unlikely to be luck)", lambda s: None if s.get("t") is None else "%.2f" % s["t"]),
+          row("Per bet, seasons before %s" % sp, lambda s: pc(s.get("older_roi"))),
+          row("Per bet, seasons from %s" % sp, lambda s: pc(s.get("newer_roi"))), ""]
     with_seasons = [k for k in keys if S[k].get("seasons")]
     if with_seasons:
-        L += ["Season by season, profit in units at 1 unit a bet (number of bets in brackets):", "",
+        L += ["Season by season, profit in units at 1 unit a bet (number of bets in brackets). A single season has few bets, so one season on its own proves little.", "",
               "| Season | " + " | ".join(title[k] for k in with_seasons) + " |", "|---|" + "---|" * len(with_seasons)]
         for n, first in enumerate(S[with_seasons[0]]["seasons"]):
             cells = []
@@ -1869,6 +2386,7 @@ def readme_block(ev):
                 cells.append("%s (%d)" % (signed(x["units"]), x["bets"]) if x else "")
             L.append("| %s | %s |" % (first["season"], " | ".join(cells)))
         L.append("")
+    L += ["</details>"]
     return "\n".join(L).rstrip()
 
 
@@ -1888,135 +2406,231 @@ def refresh_readme(ev, path="README.md"):
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Offside</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Sora:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--paper:#000;--panel:#0c0d0f;--soft:#16181b;--line:#25282c;--ink:#f3f4f5;--muted:#a3a9af;--card:#ffd21f;--card-ink:#1b1500;
---win:#62d26f;--accent:#408737;--loss:#ff5d62;--chart2:#8b95ff;--top:#0c0d0f;--top-ink:#f3f4f5;--top-muted:#a3a9af;--r:26px;color-scheme:dark}
+:root{--bg:#080b1d;--glass:rgba(255,255,255,.055);--glass2:rgba(22,27,62,.78);--thead:#141a3c;--stroke:rgba(255,255,255,.13);--ink:#eef1ff;--muted:#aab1d4;--soft:rgba(255,255,255,.055);--line:rgba(255,255,255,.1);
+--a1:#22d3ee;--a2:#818cf8;--a3:#c084fc;--win:#3df2a4;--loss:#ff6b81;--card:#ffc83d;--card-ink:#231600;--card-line:#ffc83d;--chart2:#8f9bd6;--dot:#d6dcff;
+--glow:rgba(129,140,248,.34);--shadow:0 24px 70px rgba(0,0,0,.42);--blob:.5;--paper:#080b1d;--accent:#818cf8;color-scheme:dark}
+:root[data-theme=light]{--bg:#f1f3ff;--glass:rgba(255,255,255,.72);--glass2:rgba(255,255,255,.93);--thead:#eceffd;--stroke:rgba(45,55,140,.15);--ink:#11153a;--muted:#555c86;--soft:rgba(70,80,170,.07);--line:rgba(45,55,140,.13);
+--a1:#0891b2;--a2:#4f46e5;--a3:#9333ea;--win:#07905a;--loss:#d42a47;--card:#ffbf2e;--card-line:#a96d00;--chart2:#7a84b8;--dot:#3d458f;
+--glow:rgba(79,70,229,.2);--shadow:0 18px 50px rgba(60,70,160,.16);--blob:.3;--paper:#f1f3ff;--accent:#4f46e5;color-scheme:light}
 *{box-sizing:border-box}
-html{font-size:15.5px;scroll-behavior:smooth;scroll-padding-top:86px}
-body{margin:0;background:var(--paper);color:var(--ink);font:1rem/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI Variable Text","Segoe UI",system-ui,Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}
-.in{max-width:1360px;margin:0 auto;padding:0 22px}
+html{background:var(--bg);font-size:clamp(15px,.4vw + 10px,18px);scroll-behavior:smooth;scroll-padding-top:96px}
+body{margin:0;color:var(--ink);font:1rem/1.5 Inter,"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+h1,h2,h3,.num,.yc,.big,.tiles b,.kpi b,.fl-what,.step b{font-family:Sora,"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif}
+.grad{background:linear-gradient(100deg,var(--a1),var(--a2) 55%,var(--a3));-webkit-background-clip:text;background-clip:text;color:transparent}
+/* slow coloured light behind everything */
+.aur{position:fixed;z-index:-1;border-radius:50%;filter:blur(100px);pointer-events:none;opacity:var(--blob)}
+.aur.a{width:54vw;height:54vw;left:-14vw;top:-20vw;background:radial-gradient(circle,var(--a2),transparent 66%);animation:drift1 28s ease-in-out infinite alternate}
+.aur.b{width:46vw;height:46vw;right:-12vw;top:6vw;background:radial-gradient(circle,var(--a1),transparent 66%);opacity:calc(var(--blob)*.7);animation:drift2 34s ease-in-out infinite alternate}
+.aur.c{width:60vw;height:60vw;left:26vw;top:70vh;background:radial-gradient(circle,var(--a3),transparent 66%);opacity:calc(var(--blob)*.6);animation:drift1 40s ease-in-out infinite alternate-reverse}
+@keyframes drift1{to{transform:translate(9vw,7vw) scale(1.12)}}
+@keyframes drift2{to{transform:translate(-8vw,10vw) scale(.92)}}
+.wrap{padding:0 clamp(16px,3vw,68px)}
 a{color:inherit}
-/* top bar */
-.top{position:sticky;top:0;z-index:20;background:rgba(0,0,0,.86);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
-.bar{display:flex;align-items:center;gap:14px 26px;flex-wrap:wrap;padding-top:12px;padding-bottom:12px}
-.brand{display:flex;align-items:center;gap:12px;text-decoration:none}
-.flag{width:30px;height:24px;flex:none;border-radius:3px;transform:rotate(-8deg);
- background:conic-gradient(var(--card) 0 25%, var(--loss) 0 50%, var(--card) 0 75%, var(--loss) 0)}
-h1{font-size:1.5rem;line-height:1;margin:0;font-weight:800;letter-spacing:-.02em}
-.tabs{display:flex;gap:6px;flex-wrap:wrap}
-.tabs a{text-decoration:none;font-weight:600;font-size:.9rem;padding:7px 15px;border-radius:999px;color:var(--muted);border:1px solid transparent}
-.tabs a:hover{color:var(--ink);border-color:var(--line)}
-.status{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;font-size:.84rem}
-.pill{display:inline-flex;align-items:center;gap:7px;padding:6px 13px;border-radius:999px;background:var(--soft);border:1px solid var(--line);color:var(--muted);white-space:nowrap}
-.pill b{color:var(--ink);font-weight:700;font-variant-numeric:tabular-nums}
-.pill.warn{border-color:#5c4a12;color:var(--card)}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--win);flex:none;box-shadow:0 0 0 0 rgba(98,210,111,.55);animation:pulse 2.2s ease-out infinite}
-.dot.off{background:var(--loss);animation:none}
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(98,210,111,.55)}70%{box-shadow:0 0 0 9px rgba(98,210,111,0)}100%{box-shadow:0 0 0 0 rgba(98,210,111,0)}}
-/* cards */
-main{padding:18px 0 70px}
-.bento{display:grid;grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);gap:18px;align-items:start;margin-top:18px}
-.bento.even{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
-.side{display:grid;gap:18px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:24px 24px 26px;margin-top:18px;min-width:0}
-.bento>.card,.side>.card{margin-top:0}
-h2{font-size:1.68rem;margin:0;font-weight:800;line-height:1.15;letter-spacing:-.015em}
-h2.h3,h3{font-size:1.18rem;margin:0 0 4px;font-weight:800;letter-spacing:-.01em}
-.sub{color:var(--muted);margin:6px 0 16px;max-width:72ch}
-.small{font-size:.8rem;color:var(--muted)}
-.num{font-variant-numeric:tabular-nums;font-size:1.1rem;font-weight:700}
-.match{font-weight:700}.nw{white-space:nowrap}
-.won{color:var(--win);font-weight:800}.pos{color:var(--win)}.neg{color:var(--loss)}
-/* the hero: one block per price that is out of line */
-.flagrow{background:var(--soft);border:1px solid var(--line);border-radius:20px;padding:20px 22px 18px;margin-top:14px}
-.flagrow.fresh{animation:fresh 2.6s ease-out 1}
-@keyframes fresh{from{border-color:var(--card);box-shadow:0 0 0 3px rgba(255,210,31,.35)}to{border-color:var(--line);box-shadow:0 0 0 0 rgba(255,210,31,0)}}
-.fl-top{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}
-.fl-what{font-size:1.5rem;font-weight:800;line-height:1.2;letter-spacing:-.015em;margin-top:2px}
-.fl-match{color:var(--muted);font-weight:600}
-.fl-price{text-align:right;flex:none}
-.yc{display:inline-block;background:var(--card);color:var(--card-ink);font-size:1.45rem;font-weight:800;font-variant-numeric:tabular-nums;
- padding:10px 12px 9px;min-width:68px;text-align:center;border-radius:8px;transform:rotate(-3deg)}
-.fl-price .yc{font-size:2.5rem;padding:12px 18px 10px;border-radius:11px;margin-bottom:8px}
 svg{display:block;width:100%;height:auto}
-.strip{margin:12px 0 4px}
-.fl-foot{display:flex;flex-wrap:wrap;gap:8px 10px;align-items:center;margin-top:10px}
-.news{margin-top:10px;max-width:80ch}
-a.go{display:inline-block;padding:8px 17px;border-radius:999px;background:var(--accent);color:#fff;font-weight:700;font-size:.9rem;text-decoration:none}
-a.go:hover{background:#4a9a40}
-.lnk{font-size:.86rem;color:var(--muted)}
-.tag{display:inline-block;font-size:.78rem;border:1px solid var(--line);padding:2px 10px;border-radius:999px;color:var(--muted);white-space:nowrap;line-height:1.5}
-.tag.ok{border-color:#2f6a36;color:var(--win)}
-.rc{display:inline-block;background:var(--loss);color:#1a0406;padding:2px 10px;border-radius:999px;font-weight:800;font-size:.84rem;white-space:nowrap}
-.quiet{display:flex;gap:20px;align-items:center;background:var(--soft);border:1px solid var(--line);border-radius:20px;padding:24px;margin-top:14px}
-.quiet .big{font-size:1.35rem;font-weight:800;letter-spacing:-.01em}
-.quiet p{margin:5px 0 0;color:var(--muted);max-width:70ch}
-.ghost{width:52px;height:70px;border:2px dashed #3a3f45;border-radius:8px;flex:none;transform:rotate(-3deg)}
-.setup{padding:22px;color:var(--muted)}.setup code{background:var(--soft);padding:2px 7px;border-radius:6px;font-size:.88rem;color:var(--ink)}
-/* the ticker and the tiles */
-.feed{max-height:392px;overflow:auto;margin:0 -8px;padding:0 8px;font-variant-numeric:tabular-nums}
-.fd{display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 11px;padding:10px 0;border-top:1px solid var(--line)}
-.fd:first-child{border-top:0}
-.fd i{width:8px;height:8px;border-radius:50%;background:var(--win);margin-top:7px}
-.fd.bad i{background:var(--loss)}
-.fd b{font-weight:700}.fd .t{color:var(--muted);font-weight:500;margin-left:6px;font-size:.84rem}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:10px}
-.tiles>div{background:var(--soft);border:1px solid var(--line);border-radius:18px;padding:14px 16px}
-.tiles b{display:block;font-size:1.55rem;font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
-.tiles span{display:block;font-size:.8rem;color:var(--muted);line-height:1.35;margin-top:4px}
-.tiles.big b{font-size:1.9rem}
-/* tables */
-.scroll{overflow:auto;border:1px solid var(--line);border-radius:18px;background:var(--panel)}
-.scroll.tall{max-height:640px}
+.glass{background:var(--glass);border:1px solid var(--stroke);backdrop-filter:blur(18px) saturate(150%);-webkit-backdrop-filter:blur(18px) saturate(150%);box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.07)}
+/* floating top bar */
+.top{position:sticky;top:10px;z-index:30;margin:10px clamp(16px,3vw,68px) 0;border-radius:18px;padding:9px 16px;display:flex;align-items:center;gap:10px 24px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:11px;text-decoration:none}
+.brand svg{width:34px;height:34px;flex:none}
+h1{font-size:1.45rem;line-height:1;margin:0;font-weight:700;letter-spacing:-.02em}
+.tabs{display:flex;gap:2px;flex-wrap:wrap}
+.tabs a{text-decoration:none;font-weight:500;font-size:.93rem;padding:7px 13px;border-radius:10px;color:color-mix(in srgb,var(--ink) 78%,transparent);transition:background .2s}
+.tabs a:hover{color:var(--ink);background:var(--soft)}
+.top .right{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:7px 13px;border-radius:999px;background:var(--soft);border:1px solid var(--line);color:var(--muted);white-space:nowrap;font-size:.86rem}
+.pill b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+.pill.warn{border-color:color-mix(in srgb,var(--card) 50%,transparent);background:color-mix(in srgb,var(--card) 13%,transparent);color:var(--card-line)}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--win);flex:none;animation:pulse 2s ease-out infinite}
+.dot.off{background:var(--loss);animation:none}
+@keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--win) 60%,transparent)}70%{box-shadow:0 0 0 10px transparent}100%{box-shadow:0 0 0 0 transparent}}
+/* the top of the page */
+.hero{padding-top:clamp(26px,3vw,54px)}
+.hero-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px 30px;flex-wrap:wrap}
+.hero h2{font-size:clamp(2.3rem,3.9vw,4.6rem);letter-spacing:-.035em;line-height:1.02}
+.hero .sub{font-size:1.05rem;max-width:62ch;margin:10px 0 0}
+.status{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.rail{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-top:clamp(20px,2.2vw,34px)}
+.kpi{border-radius:18px;padding:15px 17px 14px;background:var(--glass);border:1px solid var(--stroke);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);transition:transform .25s,border-color .25s}
+.kpi:hover{transform:translateY(-3px);border-color:color-mix(in srgb,var(--a2) 55%,transparent)}
+.kpi b{display:block;font-size:clamp(1.6rem,2.1vw,2.5rem);font-weight:700;line-height:1.05;font-variant-numeric:tabular-nums;letter-spacing:-.02em;
+ background:linear-gradient(100deg,var(--a1),var(--a2) 55%,var(--a3));-webkit-background-clip:text;background-clip:text;color:transparent}
+.kpi b.plain{font-size:1.2rem;line-height:1.6;background:none;color:var(--ink);white-space:nowrap}
+.kpi span{display:block;font-size:.8rem;color:var(--muted);line-height:1.35;margin-top:5px}
+#live{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(600px,100%),1fr));gap:20px;margin-top:clamp(20px,2vw,30px);align-items:start}
+#live>h3,#live>.scroll{grid-column:1/-1}
+.flagrow{position:relative;border-radius:24px;padding:clamp(18px,1.7vw,30px);min-width:0;border:1px solid transparent;
+ background:linear-gradient(var(--glass2),var(--glass2)) padding-box,linear-gradient(120deg,var(--a1),var(--a2) 50%,var(--a3)) border-box;
+ backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);box-shadow:0 30px 90px var(--glow)}
+.flagrow.calm{background:var(--glass);border-color:var(--stroke);box-shadow:var(--shadow)}
+.flagrow.fresh{animation:fresh 1.1s cubic-bezier(.2,.8,.2,1) 1}
+@keyframes fresh{from{transform:translateY(14px) scale(.985);opacity:0;box-shadow:0 0 0 6px color-mix(in srgb,var(--card) 80%,transparent)}to{transform:none;opacity:1}}
+.fl-top{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}
+.fl-match{color:var(--muted);font-weight:500}
+.fl-what{font-size:clamp(1.55rem,2vw,2.5rem);font-weight:700;line-height:1.12;letter-spacing:-.025em;margin-top:4px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px}
+.fl-price{text-align:right;flex:none}
+.yc{display:inline-block;background:linear-gradient(160deg,#ffeaa6,#ffc83d 55%,#ff9f1c);color:var(--card-ink);font-size:1.25rem;font-weight:700;font-variant-numeric:tabular-nums;
+ padding:6px 12px;min-width:62px;text-align:center;border-radius:11px;box-shadow:0 8px 22px rgba(255,170,30,.3),inset 0 1px 0 rgba(255,255,255,.65)}
+.fl-price .yc{font-size:clamp(2.2rem,2.9vw,3.5rem);padding:8px 20px;border-radius:18px;margin-bottom:9px;letter-spacing:-.03em;box-shadow:0 16px 44px rgba(255,170,30,.38),inset 0 1px 0 rgba(255,255,255,.65)}
+.fl-price .by{font-weight:600;color:var(--win)}
+.strip{margin:14px 0 2px;height:150px}
+.halo{transform-box:fill-box;transform-origin:center;animation:halo 2.2s ease-out infinite}
+@keyframes halo{from{transform:scale(.7);opacity:.75}to{transform:scale(2.7);opacity:0}}
+.steps{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:12px}
+.step{position:relative;padding-top:28px;font-size:.84rem;color:var(--muted);line-height:1.35}
+.step::before{content:"";position:absolute;top:8px;left:0;right:-12px;height:2px;border-radius:2px;background:var(--line)}
+.step:last-child::before{right:0}
+.step::after{content:"";position:absolute;top:0;left:0;width:18px;height:18px;border-radius:50%;border:2px solid var(--muted);background:var(--bg)}
+.step b{display:block;color:var(--ink);font-weight:600;font-size:.96rem;letter-spacing:-.01em}
+.step.done::before{background:linear-gradient(90deg,var(--a1),var(--a2))}
+.step.done::after{border-color:transparent;background:linear-gradient(135deg,var(--a1),var(--a3));box-shadow:0 0 16px color-mix(in srgb,var(--a2) 70%,transparent)}
+.step.now::after{border-color:var(--a1);animation:pulse2 1.6s ease-out infinite}
+.step.note::after{border-color:var(--card);background:color-mix(in srgb,var(--card) 35%,var(--bg))}
+@keyframes pulse2{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--a1) 60%,transparent)}100%{box-shadow:0 0 0 10px transparent}}
+.fl-foot{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;margin-top:18px}
+a.go{display:inline-block;padding:10px 20px;border-radius:13px;background:linear-gradient(100deg,var(--a1),var(--a2) 60%,var(--a3));color:#fff;font-weight:600;text-decoration:none;
+ box-shadow:0 10px 28px var(--glow);transition:transform .2s,box-shadow .2s}
+a.go:hover{transform:translateY(-2px);box-shadow:0 16px 38px var(--glow)}
+td a.go{padding:6px 13px;font-size:.86rem;border-radius:10px}
+.lnk{color:var(--muted);font-size:.92rem}
+.onpitch{color:var(--muted);font-size:.88rem;margin-top:12px;max-width:92ch}
+.quiet{position:relative;overflow:hidden;display:flex;gap:20px;align-items:center;border-radius:24px;padding:clamp(18px,1.7vw,30px);min-width:0;background:var(--glass);border:1px solid var(--stroke);
+ backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);box-shadow:var(--shadow)}
+.quiet::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 42%,color-mix(in srgb,var(--a1) 16%,transparent) 50%,transparent 58%);transform:translateX(-100%);animation:sweep 3.8s ease-in-out infinite;pointer-events:none}
+@keyframes sweep{to{transform:translateX(100%)}}
+.quiet .big{font-size:clamp(1.45rem,1.8vw,2.1rem);font-weight:700;line-height:1.15;letter-spacing:-.02em}
+.quiet p{margin:6px 0 0;color:var(--muted);max-width:70ch}
+.quiet code{background:var(--soft);padding:2px 7px;border-radius:6px}
+.ghost{width:54px;height:54px;border-radius:50%;flex:none;border:2px solid color-mix(in srgb,var(--a1) 60%,transparent);position:relative}
+.ghost::before,.ghost::after{content:"";position:absolute;inset:8px;border-radius:50%;border:2px solid color-mix(in srgb,var(--a2) 55%,transparent)}
+.ghost::after{inset:19px;background:var(--a1);border:0;animation:pulse2 1.8s ease-out infinite}
+.bk{display:inline-flex;align-items:center;justify-content:center;width:1.9em;height:1.9em;border-radius:50%;color:#fff;font:700 .7em/1 Inter,"Segoe UI",system-ui,sans-serif;letter-spacing:.02em;flex:none;vertical-align:middle;margin-right:.45em;box-shadow:0 0 0 2px var(--stroke)}
+td .bk{font-size:.66rem}
+/* the log of page reads */
+.feed{max-height:280px;overflow:auto;font-variant-numeric:tabular-nums;font-size:.88rem;border:1px solid var(--line);border-radius:14px;background:color-mix(in srgb,var(--bg) 35%,transparent)}
+.lg{display:grid;grid-template-columns:7.2em minmax(11em,1.1fr) minmax(0,2.2fr) auto;gap:0 16px;align-items:baseline;padding:8px 15px;border-top:1px solid var(--line)}
+.lg:first-child{border-top:0}
+.lg.in{animation:logline .7s ease-out}
+@keyframes logline{from{background:color-mix(in srgb,var(--a1) 22%,transparent)}to{background:transparent}}
+.lg .t{color:var(--muted)}.lg .m{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lg .d{color:var(--muted)}.lg .d b{color:var(--win);font-weight:600}.lg.bad .d b{color:var(--loss)}
+.lg .r{color:var(--muted);font-size:.8rem;white-space:nowrap}
+@media (max-width:820px){.lg{grid-template-columns:7.2em minmax(0,1fr)}.lg .d,.lg .r{grid-column:2}}
+.top a.go{padding:7px 15px;font-size:.88rem;border-radius:11px}
+.cta{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);gap:clamp(20px,3vw,56px);align-items:center}
+.cta .sub{font-size:1.02rem}
+.dc{background:#2b2d31;color:#dbdee1;border-radius:12px;border-left:5px solid #ffc83d;padding:14px 18px 15px;font-size:.92rem;line-height:1.5;box-shadow:0 18px 40px rgba(0,0,0,.28)}
+.dc.ok{border-left-color:#3df2a4}.dc.off{border-left-color:#8f9bd6}
+.dc .who{display:flex;align-items:center;gap:9px;font-weight:600;color:#f2f3f5;margin-bottom:8px}
+.dc .who i{font-style:normal;font-size:.68rem;font-weight:700;background:#5865f2;color:#fff;border-radius:4px;padding:1px 5px}
+.dc .who span{font-weight:400;color:#949ba4;font-size:.8rem}
+.dc .tt{color:#00a8fc;font-weight:700;font-size:1.02rem}
+.dc p{margin:6px 0 0}
+.dc .ln{margin-top:8px;white-space:pre-line}
+.dc .lk{margin-top:8px;color:#00a8fc}
+@media (max-width:980px){.cta{grid-template-columns:1fr}}
+a.bkl{color:inherit;text-decoration:none;border-bottom:1px dashed color-mix(in srgb,var(--ink) 35%,transparent);transition:border-color .2s,color .2s}
+a.bkl:hover{color:var(--a2);border-bottom-color:var(--a2)}
+/* sections */
+main{padding:0 0 80px}
+.card{border-radius:24px;padding:clamp(18px,1.8vw,32px);margin-top:clamp(26px,2.5vw,44px);min-width:0;background:var(--glass);border:1px solid var(--stroke);
+ backdrop-filter:blur(18px) saturate(150%);-webkit-backdrop-filter:blur(18px) saturate(150%);box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.06)}
+.cols{display:grid;grid-template-columns:minmax(0,1.9fr) minmax(280px,1fr);gap:0 clamp(22px,2.2vw,38px);align-items:start}
+.side{display:grid;gap:0}
+h2{font-size:clamp(1.55rem,2vw,2.3rem);margin:0;font-weight:700;line-height:1.1;letter-spacing:-.025em}
+h2.h3,h3{font-size:clamp(1.15rem,1.25vw,1.45rem);margin:0 0 4px;font-weight:600;letter-spacing:-.015em}
+.sub{color:var(--muted);margin:7px 0 16px;max-width:88ch}
+.small{font-size:.82rem;color:var(--muted)}
+.num{font-variant-numeric:tabular-nums;font-size:1.14rem;font-weight:600;letter-spacing:-.01em}
+.match{font-weight:600}.nw{white-space:nowrap}
+.won{color:var(--win);font-weight:700}.pos{color:var(--win)}.neg{color:var(--loss)}
+.tag{display:inline-block;font-size:.8rem;border:1px solid var(--line);background:var(--soft);padding:2px 10px;border-radius:999px;color:var(--muted);white-space:nowrap;line-height:1.5}
+.tag.ok{border-color:color-mix(in srgb,var(--win) 42%,transparent);background:color-mix(in srgb,var(--win) 13%,transparent);color:var(--win)}
+.tag.warn{border-color:color-mix(in srgb,var(--card) 50%,transparent);background:color-mix(in srgb,var(--card) 13%,transparent);color:var(--card-line)}
+.rc{display:inline-block;background:color-mix(in srgb,var(--loss) 18%,transparent);border:1px solid color-mix(in srgb,var(--loss) 50%,transparent);color:var(--loss);padding:2px 10px;border-radius:999px;font-weight:600;font-size:.86rem;white-space:nowrap}
+.setup{padding:20px;color:var(--muted)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.tiles>div{background:var(--soft);border:1px solid var(--line);border-radius:16px;padding:14px 16px}
+.tiles b{display:block;font-size:clamp(1.55rem,1.9vw,2.3rem);font-weight:700;line-height:1.05;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.tiles span{display:block;font-size:.82rem;color:var(--muted);line-height:1.35;margin-top:5px}
+.scroll{overflow:auto;border:1px solid var(--line);border-radius:16px;background:color-mix(in srgb,var(--bg) 35%,transparent)}
+.scroll.tall{max-height:min(72vh,680px)}
+.scroll.big{max-height:min(88vh,1000px)}
+.bk{position:relative;overflow:hidden}
+.bk img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;border-radius:inherit}
+.rowhead{display:flex;justify-content:space-between;align-items:flex-end;gap:18px;flex-wrap:wrap;margin-bottom:6px}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border-radius:999px;font-weight:650;font-size:.78rem;white-space:nowrap;border:1px solid transparent}
+.pill.in{background:var(--win);color:var(--bg)}
+.pill.dup{border-color:var(--win);color:var(--win)}
+.pill.now{background:var(--card);color:#1a1300}
+.pill.no{border-color:var(--stroke);color:var(--muted)}
+tr.inrec td{background:color-mix(in srgb,var(--win) 9%,transparent)}
+tr.inrec td:first-child{box-shadow:inset 4px 0 0 var(--win)}
+tr.notin .match,tr.notin .num{opacity:.72}
+
 table{border-collapse:collapse;width:100%;min-width:820px}
-thead th{position:sticky;top:0;z-index:1;background:var(--soft);text-align:left;font-weight:600;font-size:.84rem;color:var(--muted);padding:11px 14px;white-space:nowrap}
-td{padding:13px 14px;border-top:1px solid var(--line);vertical-align:middle}
-tbody tr:hover td{background:rgba(255,255,255,.022)}
-td.when{white-space:nowrap;width:1%}td.m{min-width:190px}td.st{min-width:200px;max-width:260px}
-td.st .tag,td.m .tag{white-space:normal;border-radius:12px;line-height:1.35;padding:3px 10px}
-.meter{display:inline-block;width:120px;height:8px;background:var(--soft);border-radius:999px;overflow:hidden;vertical-align:middle;margin-right:9px;border:1px solid var(--line)}
-.meter i{display:block;height:100%;background:var(--chart2)}.meter.hot i{background:var(--card)}
+thead th{position:sticky;top:0;z-index:1;background:var(--thead);text-align:left;font-weight:500;font-size:.84rem;color:var(--muted);padding:12px 15px;white-space:nowrap}
+td{padding:14px 15px;border-top:1px solid var(--line);vertical-align:middle;transition:background .2s}
+tbody tr:first-child td{border-top:0}
+tbody tr:hover td{background:var(--soft)}
+td.when{white-space:nowrap;width:1%}td.m{min-width:190px}td.st{min-width:210px;max-width:320px}
+td.st .tag,td.m .tag{white-space:normal;border-radius:11px;line-height:1.35;padding:3px 10px}
+.meter{display:inline-block;width:120px;height:8px;background:var(--soft);border-radius:999px;overflow:hidden;vertical-align:middle;margin-right:9px}
+.meter i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--a1),var(--a2))}.meter.hot i{background:linear-gradient(90deg,#ffc83d,#ff9f1c)}
 .spark{display:block;width:150px;height:34px}
-.thumb{display:block;width:96px;height:60px;object-fit:cover;object-position:top;border:1px solid var(--line);border-radius:10px}
-/* controls */
-button{font:inherit;font-weight:700;padding:9px 17px;border:1px solid var(--line);background:var(--soft);color:var(--ink);cursor:pointer;border-radius:999px}
-button:hover{border-color:#4a5057}
-button.mini{padding:5px 13px;font-size:.8rem;margin-top:7px;background:transparent}
-button.mini[disabled]{opacity:.55;cursor:default}
-.seg{display:inline-flex;gap:6px;flex-wrap:wrap}
-.seg button{background:transparent;color:var(--muted);padding:8px 16px}
-.seg button[aria-pressed=true]{background:var(--ink);color:#000;border-color:var(--ink)}
-button:focus-visible,a:focus-visible{outline:3px solid var(--card);outline-offset:2px}
+.thumb{display:block;width:104px;height:64px;object-fit:cover;object-position:top;border:1px solid var(--stroke);border-radius:10px}
+button{font:inherit;font-weight:500;padding:9px 16px;border:1px solid var(--stroke);background:var(--soft);color:var(--ink);cursor:pointer;border-radius:12px;transition:border-color .2s,background .2s,transform .2s}
+button:hover{border-color:color-mix(in srgb,var(--a2) 65%,transparent);transform:translateY(-1px)}
+button.mini{padding:6px 13px;font-size:.84rem;margin-top:8px}
+button.mini[disabled]{opacity:.6;cursor:default;transform:none}
+.seg{display:inline-flex;gap:4px;padding:4px;border:1px solid var(--stroke);border-radius:14px;background:var(--soft)}
+.seg button{border:0;background:transparent;color:var(--muted);padding:8px 16px;border-radius:10px}
+.seg button:hover{transform:none;color:var(--ink)}
+.seg button[aria-pressed=true]{background:linear-gradient(100deg,var(--a1),var(--a2) 60%,var(--a3));color:#fff;box-shadow:0 8px 22px var(--glow)}
+button:focus-visible,a:focus-visible{outline:3px solid var(--a1);outline-offset:2px}
 .acts{display:flex;flex-wrap:wrap;gap:8px 10px;align-items:center;margin:0 0 14px}
 .acts button.mini{margin:0}
-.key{display:flex;flex-wrap:wrap;gap:6px 24px;font-size:.85rem;color:var(--muted);margin-top:10px}
+.key{display:flex;flex-wrap:wrap;gap:6px 24px;font-size:.86rem;color:var(--muted);margin-top:10px}
 .key i{display:inline-block;width:24px;height:3px;border-radius:2px;vertical-align:middle;margin-right:7px}
-ol,ul{padding-left:20px;margin:8px 0}li{margin:8px 0;max-width:68ch;color:#d6d9dc}
-footer{margin-top:34px;font-size:.8rem;color:var(--muted);padding:0 6px}
-@media (max-width:1040px){.bento,.bento.even{grid-template-columns:1fr}}
-@media (max-width:760px){.tabs{display:none}.fl-top{flex-direction:column}.fl-price{text-align:left}.card{padding:20px 16px 22px;border-radius:20px}html{font-size:15px}}
-@media (prefers-reduced-motion:reduce){.dot,.flagrow.fresh{animation:none}html{scroll-behavior:auto}}
+ol,ul{padding-left:20px;margin:8px 0}li{margin:9px 0;max-width:70ch}
+footer{margin-top:30px;font-size:.82rem;color:var(--muted)}
+@media (max-width:1080px){.cols{grid-template-columns:1fr}.steps{grid-template-columns:repeat(2,minmax(0,1fr))}.step::before{right:0}}
+@media (max-width:720px){.tabs{display:none}.fl-top{flex-direction:column}.fl-price{text-align:left}.steps{grid-template-columns:1fr}.hero-head{align-items:flex-start}.status{justify-content:flex-start}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}html{scroll-behavior:auto}}
 </style></head><body>
-<header class="top"><div class="in bar">
-<a class="brand" href="#h-live" aria-label="Offside, top of page"><span class="flag" aria-hidden="true"></span><h1>Offside</h1></a>
-<nav class="tabs" aria-label="Sections"><a href="#h-live">Live</a><a href="#h-seen">Earlier</a><a href="#h-all">Watching</a><a href="#h-rec">Record</a><a href="#h-ev">Evidence</a></nav>
-<div class="status" id="status" role="status"><span class="pill">Starting…</span></div>
-</div></header>
-<main class="in">
-<div class="bento">
-<section class="card" aria-labelledby="h-live"><h2 id="h-live">Out of line right now</h2>
-<p class="sub">One bookmaker paying clearly more than all the others for the same result. Each price is read again a minute later before it counts.</p>
-<div id="live"></div></section>
-<div class="side">
-<section class="card" aria-labelledby="h-feed"><h2 class="h3" id="h-feed">Live reads</h2>
-<p class="sub" style="margin-bottom:8px">Each line is one odds page fetched fresh from the site through Context.dev, as it happens.</p>
-<div class="feed" id="feed"></div></section>
-<section class="card" id="workcard" style="display:none" aria-labelledby="h-work"><h2 class="h3" id="h-work">Since switch-on</h2>
-<div class="tiles" id="work" style="margin-top:12px"></div></section>
-</div></div>
+<div class="aur a" aria-hidden="true"></div><div class="aur b" aria-hidden="true"></div><div class="aur c" aria-hidden="true"></div>
+<header class="top glass">
+<a class="brand" href="#h-live" aria-label="Offside, top of page"><svg viewBox="0 0 34 34" aria-hidden="true"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#22d3ee"/><stop offset=".55" stop-color="#818cf8"/><stop offset="1" stop-color="#c084fc"/></linearGradient></defs>
+<rect width="34" height="34" rx="10" fill="url(#lg)"/><circle cx="8" cy="17" r="2.2" fill="#fff" opacity=".8"/><circle cx="13.5" cy="17" r="2.2" fill="#fff" opacity=".8"/><line x1="19.5" y1="7" x2="19.5" y2="27" stroke="#fff" stroke-width="2" stroke-dasharray="3 2.6" stroke-linecap="round"/><circle cx="26" cy="17" r="3.4" fill="#ffc83d"/></svg><h1>Offside</h1></a>
+<nav class="tabs" aria-label="Sections"><a href="#h-live">Now</a><a href="#h-seen">Earlier</a><a href="#h-all">Watching</a><a href="#h-rec">Record</a><a href="#h-ev">Evidence</a></nav>
+<div class="right"><a class="go" id="join" target="_blank" rel="noopener" hidden>Join the Discord</a><button type="button" class="mini" id="theme" style="margin:0" aria-label="Switch between the dark and light look">Light look</button></div>
+</header>
 
-<section class="card" aria-labelledby="h-seen"><h2 id="h-seen">Out of line earlier</h2>
-<p class="sub">Every price that has been out of line in the last day and a half, and what became of it.</p>
+<section class="hero wrap" aria-labelledby="h-live">
+<div class="hero-head"><div><h2 id="h-live">Out of line right now</h2>
+<p class="sub" id="herosub">One bookmaker paying clearly more than all the others for the same result. A price has to still be out of line a minute later before it counts.</p></div>
+<div class="status" id="status" role="status"><span class="pill">Starting…</span></div></div>
+<div class="rail" id="work" style="display:none" aria-label="What Context.dev has done since switch-on"></div>
+<div id="live"></div>
+</section>
+
+<main class="wrap">
+<section class="card cta" aria-labelledby="h-join">
+<div><h2 id="h-join">Get the alert while the price is still there</h2>
+<p class="sub">Every out-of-line price is posted to the Offside Discord the moment it is seen, with a link to the bookmaker. The same message then updates as the price is confirmed, found on the bookmaker's own site, or gone.</p>
+<div id="joinbox"></div></div>
+<div><div class="small" id="dclabel" style="margin-bottom:8px"></div><div class="dc" id="dcprev"></div></div>
+</section>
+
+<section class="card" aria-labelledby="h-feed"><h2 class="h3" id="h-feed">Reads log</h2>
+<p class="sub" style="margin-bottom:12px">Every odds page fetched through Context.dev, newest first. These are page reads before kick-off, not matches in play.</p>
+<div class="feed" id="feed"></div></section>
+
+<section class="card" aria-labelledby="h-seen"><div class="rowhead"><div><h2 id="h-seen">Out of line earlier</h2>
+<p class="sub" id="seensub">Every price that has been out of line in the last day and a half, and what became of it.</p></div>
+<div class="seg" id="seenseg" role="group" aria-label="Which prices to show"></div></div>
 <div class="scroll tall" id="seen"></div></section>
 
 <section class="card" aria-labelledby="h-all"><h2 id="h-all">Every match being watched</h2>
@@ -2026,49 +2640,48 @@ footer{margin-top:34px;font-size:.8rem;color:var(--muted);padding:0 6px}
 <p class="sub">One shared record for everyone using Offside, not a personal account. It shows what would have happened if every result Offside confirmed had been backed once, at the price recorded, with 2% of a bank of 1,000. No real money is involved. Each entry keeps a screenshot, the saved page and Context.dev's request id as proof.</p>
 <div class="acts"><button type="button" class="mini" id="notif">Turn on alerts in this browser</button><span class="small" id="notifmsg"></span>
 <button type="button" class="mini" id="settle">Check results now</button><span class="small" id="settlemsg"></span></div>
-<div class="tiles big" id="paper" style="margin-bottom:14px"></div>
-<p class="sub" id="recsub" style="max-width:96ch"></p><div class="scroll" id="record"></div></section>
+<div class="tiles" id="paper" style="margin-bottom:14px"></div>
+<p class="sub" id="recsub" style="max-width:110ch"></p><div class="scroll big" id="record"></div></section>
 
-<div class="bento">
+<div class="cols">
 <section class="card" aria-labelledby="h-ev"><h2 id="h-ev">Does the rule hold up?</h2>
 <p class="sub" id="evsub"></p>
 <div class="seg" id="switch" role="group" aria-label="How strict the rule is"></div>
-<div class="tiles big" id="figs" style="margin:16px 0 10px"></div><p class="small" id="tnote" style="margin:0 0 16px;max-width:90ch"></p><div id="chart"></div>
+<div class="tiles" id="figs" style="margin:16px 0 10px"></div><p class="small" id="tnote" style="margin:0 0 16px;max-width:100ch"></p><div id="chart"></div>
 <div class="key"><span><i style="background:var(--win)"></i>Betting the out-of-line price</span>
 <span><i style="background:var(--chart2)"></i>The same bets at the average price</span></div>
 <h3 style="margin-top:28px">Season by season</h3><p class="small" id="seasnote" style="margin:0 0 8px"></p><div id="seasons"></div>
 <h3 style="margin-top:28px">What that means for a bank of 1,000</h3><div id="pot" style="margin-top:10px"></div></section>
 <div class="side">
 <section class="card" aria-labelledby="h-read"><h2 class="h3" id="h-read">How to read it</h2>
-<ul><li>One unit is staked on every bet the rule would have made, in date order.</li>
-<li>The return is per bet, on the money staked. It is not a yearly figure. A bet settles in about two hours, so the same bank is staked again and again, which is why a 13% return per bet becomes a much larger return on the bank over a year.</li>
-<li>The gap between the two lines is what the out-of-line price is worth. The picks alone do not make money.</li>
-<li>The rule and its settings come from a study published in 2017 using data up to 2015. Every match here was played after that, so the rule could not have been fitted to it.</li>
-<li id="basel"></li>
-<li id="yieldnote"></li>
-<li>The ceiling is capacity, not the edge. The rule fires a few dozen times a season, and bookmakers cut the stakes of accounts that win this way.</li></ul></section>
+<ul><li>The return is per bet, not per year. The same bank is staked again and again.</li>
+<li>The gap between the two lines is what the out-of-line price is worth.</li>
+<li>Every match was played after the rule was published, so it could not have been fitted to them.</li>
+<li id="basel"></li></ul><span id="yieldnote" hidden></span></section>
 <section class="card"><h2 class="h3">How it works</h2><ol>
-<li>Context.dev finds upcoming matches from league pages, renders each match's odds page as a UK visitor, and its parse rules return every bookmaker's price as structured data.</li>
-<li>The average price across all bookmakers is taken as the fair view of the match.</li>
-<li>A bookmaker's price is flagged when it pays more than that view allows, even after a safety cushion of 3 to 5 points.</li>
-<li>If the price is still there a minute later, it is added to the system's record with a screenshot and a saved copy of the page as proof. Each result is added once per match.</li>
-<li>Context.dev then searches for the bookmaker's own page for that match and reads the price there, as a second, independent source.</li>
-<li>Context.dev also searches for team news that might explain why that bookmaker is out of line.</li>
-<li>After the match, the final score is looked up and the entry is marked won or lost.</li></ol></section>
+<li>Context.dev reads every bookmaker's price for each match.</li>
+<li>A price well above the average of the rest is flagged.</li>
+<li>If it is still out of line a minute later, it is recorded with a screenshot.</li>
+<li>Context.dev then checks the bookmaker's own site, the team news and, later, the result.</li></ol></section>
 <section class="card"><h2 class="h3">Limits</h2><ul>
-<li>In the tested leagues the medium rule fires once or twice a week. The edge per bet is large, the number of bets is small.</li>
-<li>Bookmakers restrict accounts that bet this way, and can cancel a bet placed at a mistaken price.</li>
-<li>The test covers 18 European leagues. Anything else is marked as outside the tested leagues.</li>
-<li>Live prices come from one odds comparison site. A flagged price is then looked for on the bookmaker's own site, which does not always answer.</li>
-<li>Offside finds prices. It does not place bets, and betting can lose money.</li></ul></section>
-</div>
-</div>
+<li>The medium rule fires once or twice a week.</li>
+<li>Bookmakers limit accounts that win this way.</li>
+<li>Tested on 18 European leagues. Live prices come from one comparison site.</li>
+<li>Offside finds prices. It does not place bets.</li></ul></section>
+</div></div>
 <footer>Offside version VERSION_HERE. Fixtures, odds pages, price extraction, screenshots and team news: Context.dev.
 Historical results and odds: football-data.co.uk. The rule follows Kaunitz, Zhong and Kreiner (2017).</footer></main>
 <script>
 let S=null, setting="4", seen=new Set(), first=true;
 const $=id=>document.getElementById(id);
-const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+Object.defineProperty(HTMLElement.prototype,"html",{set(v){ if(this.__h!==v){ this.__h=v; this.innerHTML=v; } }, get(){ return this.innerHTML; }});
+const calm=window.matchMedia&&window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+function tween(el,to){ if(!el) return; const from=el._v==null? 0 : el._v; el._v=to;
+  if(calm||from===to){ el.textContent=to.toLocaleString(); return; }
+  const t0=performance.now(), d=900, step=t=>{ const k=Math.min(1,(t-t0)/d), e=1-Math.pow(1-k,3);
+    el.textContent=Math.round(from+(to-from)*e).toLocaleString(); if(k<1) requestAnimationFrame(step); };
+  requestAnimationFrame(step); }
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const clock=t=>t?new Date(t*1000).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"}):"";
 const day=t=>t?new Date(t*1000).toLocaleString([], {weekday:"short",hour:"2-digit",minute:"2-digit"}):"";
 function until(k,now){ if(!k) return "time not given"; const d=k-now; if(d<=0) return "started";
@@ -2078,9 +2691,13 @@ const names={home:"Home win",draw:"Draw",away:"Away win"};
 const matchName=e=> e.home? esc(e.home)+" v "+esc(e.away) : "<span class='small'>teams not read from the page</span>";
 const scope=e=> (e.scope==="tested"? "" : " <span class='tag'>outside the tested leagues</span>")+(e.in_play&&e.book? " <span class='tag'>in play, not covered by the test</span>":"");
 const plural=(n,w)=>n+" "+w+(n===1?"":(w.endsWith("ch")?"es":"s"));
-function checked(v, there){ return v==="seen"? "<span class='tag ok'>same price found on the bookmaker's own site</span>" :
-  v==="moved"? "<span class='tag'>bookmaker's own site showed "+(there? Number(there).toFixed(2):"a different price")+"</span>" :
+function checked(v, there, t){ const at=t? ", checked "+esc(clock(t)) : "";
+  return v==="seen"? "<span class='tag ok'>same price on the bookmaker's own site"+at+"</span>" :
+  v==="moved"? "<span class='tag'>bookmaker's own site showed "+(there? Number(there).toFixed(2):"a different price")+at+"</span>" :
   v==="not shown"? "<span class='tag'>bookmaker's match page found, price not readable</span>" :
+  v==="not listed"? "<span class='tag'>bookmaker's pages were read, this match was not on them"+at+"</span>" :
+  v==="no page"? "<span class='tag'>no page for this match found on the bookmaker's site"+at+"</span>" :
+  v==="blocked"? "<span class='tag'>the bookmaker's page would not open"+at+"</span>" :
   v==="unreadable"? "<span class='tag'>bookmaker's match page not found or blocked</span>" :
   (v==="no link"||v==="no site")? "<span class='tag'>bookmaker's own site not checked</span>" : ""; }
 
@@ -2088,95 +2705,146 @@ function renderStatus(){
   const bad=S.leagues.concat(S.pages).filter(x=>x.source&&x.source.error&&x.source.error!=="match has started");
   const upcoming=S.pages.filter(w=>!w.kickoff||w.kickoff>S.now).length + (S.leagues.length? S.matches.filter(m=>String(m.id).indexOf("api:")===0).length : 0);
   let h="";
-  if(S.last_read) h+="<span class='pill'><span class='dot'></span><b>Live</b></span><span class='pill'><b>"+upcoming+"</b> "+(upcoming===1?"match":"matches")+" watched</span>"+
+  if(S.last_read) h+="<span class='pill'><span class='dot'></span><b>Scanning</b></span><span class='pill'><b>"+upcoming+"</b> "+(upcoming===1?"match":"matches")+" watched</span>"+
     "<span class='pill'>last read <b>"+esc(clock(S.last_read))+"</b></span>";
   else h+="<span class='pill'><span class='dot off'></span>First read in progress</span>";
   if(S.backlog) h+="<span class='pill'><b>"+S.backlog+"</b> queued</span>";
   if(bad.length) h+="<span class='pill warn'>"+plural(bad.length,"page")+" could not be read</span>";
   if(!S.has_ctx_key) h+="<span class='pill warn'>No Context.dev key set</span>";
   if(S.in_play_mode) h+="<span class='pill'>in-play reading on</span>";
-  $("status").innerHTML=h;
+  $("status").html=h;
 }
 function who(e){ return e.outcome==="home"? esc(e.home)+" to win" : e.outcome==="away"? esc(e.away)+" to win" : "The draw"; }
+function bk(name){
+  // a small coloured badge with the bookmaker's initials, so the same bookmaker is easy to spot down a column
+  let h=0; for(const c of String(name)) h=(h*31+c.charCodeAt(0))%360;
+  const w=String(name).replace(/[^A-Za-z0-9 ]/g,"").split(" ").filter(Boolean);
+  const ini=(w.length>1? w[0][0]+w[1][0] : (w[0]||"?").slice(0,2)).toUpperCase();
+  // the bookmaker's own logo when Context.dev's brand data has one; the initials stay underneath in case the image does not load
+  const b=(S.brands||{})[String(name).toLowerCase().replace(/[^a-z0-9]/g,"")];
+  return "<span class='bk' style='background:hsl("+h+" 55% 34%)' aria-hidden='true'>"+esc(ini)+
+    (b? "<img src='"+esc(b.icon)+"' alt='' loading='lazy' referrerpolicy='no-referrer' style='background:"+esc(b.bg||"transparent")+"' onerror='this.remove()'>" : "")+"</span>";
+}
+function site(name){ const d=(S.book_sites||{})[String(name).toLowerCase().replace(/[^a-z0-9]/g,"")]; return d? "https://"+d : ""; }
+function pageFor(name, url){
+  // the bookmaker's own page for the league this match is in, if one is known
+  const rest=String(url||"").split("/football/")[1]||"", seg=rest.split("/");
+  if(seg.length<4) return "";
+  return ((S.book_pages||{})[String(name).toLowerCase().replace(/[^a-z0-9]/g,"")]||{})[(seg[0]+"/"+seg[1]).toLowerCase()]||"";
+}
+function bkl(name, link, url){
+  // the bookmaker's badge and name, as a link: its page for the match if found, else its page for the league, else its site
+  const u=(link&&/^https?:/.test(link))? link : (pageFor(name, url)||site(name));
+  return u? "<a class='bkl' href='"+esc(u)+"' target='_blank' rel='noopener' title='Open "+esc(name)+" in a new tab'>"+bk(name)+esc(name)+"</a>" : bk(name)+esc(name);
+}
 function strip(e, quiet){
-  const hot=quiet? "var(--ink)" : "var(--card)";
-  // every other bookmaker's price for this result as a dot, with this bookmaker's price far from them
+  // every other bookmaker's price for this result is a dot; the dashed line is where a price becomes out of line
   const f=(e.field||[]).filter(x=>x[1]>1 && x[0]!==e.book); if(f.length<3) return "";
-  const W=680,H=128,L=14,R=14,y=62, vals=f.map(x=>x[1]).concat([e.price,e.average,e.needed]);
+  const box=$("live").clientWidth||680, n0=Math.max(1,(S.live||[]).length||2), across=Math.max(1,Math.min(n0>3?3:n0, Math.floor((box+16)/616)));
+  const W=Math.max(300,Math.round(box/across-(across>1?16:0)-60)),H=150,L=14,R=14,y=84, vals=f.map(x=>x[1]).concat([e.price,e.average,e.needed]);
   let a=Math.min(...vals), b=Math.max(...vals); const pad=(b-a)*0.07||0.02; a-=pad; b+=pad;
   const X=v=>L+(v-a)/(b-a)*(W-L-R), ax=X(e.average), nx=X(e.needed), px=X(e.price);
-  let g="<rect x='"+nx.toFixed(1)+"' y='"+(y-40)+"' width='"+(W-R-nx).toFixed(1)+"' height='80' rx='10' fill='var(--card)' opacity='.08'/>"+
+  let g="<rect x='"+nx.toFixed(1)+"' y='"+(y-30)+"' width='"+(W-R-nx).toFixed(1)+"' height='60' rx='12' fill='var(--card)' opacity='.12'/>"+
     "<line x1='"+L+"' x2='"+(W-R)+"' y1='"+y+"' y2='"+y+"' stroke='var(--line)' stroke-width='2' stroke-linecap='round'/>";
   const cols={};
   for(const x of f){ const cx=Math.round(X(x[1])/3)*3; cols[cx]=(cols[cx]||0)+1; }
-  for(const cx in cols){ const n=cols[cx], step=n>9? 80/(n-1) : 10;      // bookmakers on the same price stack up, centred on the line
-    for(let i=0;i<n;i++) g+="<circle cx='"+cx+"' cy='"+(y+(i-(n-1)/2)*step).toFixed(1)+"' r='4.5' fill='var(--muted)' opacity='.75'/>"; }
-  g+="<line x1='"+ax.toFixed(1)+"' x2='"+ax.toFixed(1)+"' y1='"+(y-44)+"' y2='"+(y+46)+"' stroke='var(--chart2)' stroke-width='2'/>"+
-    "<text x='"+(ax<180? ax+8 : ax-8).toFixed(1)+"' y='"+(H-4)+"' text-anchor='"+(ax<180?"start":"end")+"' font-size='13' fill='var(--chart2)'>the rest average "+e.average.toFixed(2)+"</text>"+
-    "<line x1='"+nx.toFixed(1)+"' x2='"+nx.toFixed(1)+"' y1='"+(y-46)+"' y2='"+(y+44)+"' stroke='var(--card)' stroke-width='1.5' stroke-dasharray='4 4'/>"+
-    "<text x='"+(nx>W-190? nx-8 : nx+8).toFixed(1)+"' y='13' text-anchor='"+(nx>W-190?"end":"start")+"' font-size='13' fill='var(--card)'>out of line above "+e.needed.toFixed(2)+"</text>"+
-    "<circle cx='"+px.toFixed(1)+"' cy='"+y+"' r='"+(quiet?7:9)+"' fill='"+hot+"'/>"+
-    "<text x='"+px.toFixed(1)+"' y='"+(y-17)+"' text-anchor='"+(px>W-80?"end":(px<80?"start":"middle"))+"' font-size='14' font-weight='700' fill='"+hot+"'>"+esc(e.book)+" "+e.price.toFixed(2)+"</text>";
-  return "<svg class='strip' viewBox='0 0 "+W+" "+H+"' role='img' aria-label='Every bookmaker price for this result, with this one far from the rest'>"+g+"</svg>";
+  for(const cx in cols){ const n=cols[cx], step=n>9? 80/(n-1) : 10;
+    for(let i=0;i<n;i++) g+="<circle cx='"+cx+"' cy='"+(y+(i-(n-1)/2)*step).toFixed(1)+"' r='4.4' fill='var(--dot)' opacity='.92'/>"; }
+  g+="<line x1='"+ax.toFixed(1)+"' x2='"+ax.toFixed(1)+"' y1='"+(y-46)+"' y2='"+(y+46)+"' stroke='var(--a2)' stroke-width='2' stroke-linecap='round'/>"+
+    "<text x='"+(ax<190? ax+8 : ax-8).toFixed(1)+"' y='"+(H-4)+"' text-anchor='"+(ax<190?"start":"end")+"' font-size='13' fill='var(--a2)'>the rest average "+e.average.toFixed(2)+"</text>"+
+    "<line x1='"+nx.toFixed(1)+"' x2='"+nx.toFixed(1)+"' y1='"+(y-30)+"' y2='"+(y+30)+"' stroke='var(--card-line)' stroke-width='2.5' stroke-dasharray='6 6' stroke-linecap='round'/>"+
+    "<text x='"+(nx>W-200? nx-9 : nx+9).toFixed(1)+"' y='13' text-anchor='"+(nx>W-200?"end":"start")+"' font-size='13' font-weight='600' fill='var(--card-line)'>out of line above "+e.needed.toFixed(2)+"</text>";
+  const anchor=px>W-90?"end":(px<90?"start":"middle");
+  if(quiet){
+    g+="<circle cx='"+px.toFixed(1)+"' cy='"+y+"' r='8' fill='var(--bg)' stroke='var(--a1)' stroke-width='3'/>"+
+      "<text x='"+px.toFixed(1)+"' y='"+(y-42)+"' text-anchor='"+anchor+"' font-size='14' font-weight='600' fill='var(--ink)'>"+esc(e.book)+" "+e.price.toFixed(2)+"</text>";
+  } else {
+    g+="<circle class='halo' cx='"+px.toFixed(1)+"' cy='"+y+"' r='9' fill='var(--card)'/>"+
+      "<circle cx='"+px.toFixed(1)+"' cy='"+y+"' r='9.5' fill='#ffc83d' style='filter:drop-shadow(0 0 9px rgba(255,180,40,.9))'/>"+
+      "<text x='"+px.toFixed(1)+"' y='"+(y-42)+"' text-anchor='"+anchor+"' font-size='15' font-weight='700' fill='var(--card-line)'>"+esc(e.book)+" "+e.price.toFixed(2)+"</text>";
+  }
+  return "<svg class='strip' viewBox='0 0 "+W+" "+H+"' preserveAspectRatio='xMidYMid meet' role='img' aria-label='Every bookmaker price for this result, with this one beyond the line'>"+g+"</svg>";
+}
+function steps(e){
+  const s=[], add=(cls,title,txt)=>s.push("<div class='step "+cls+"'><b>"+title+"</b>"+txt+"</div>"), v=e.verify, B=esc(e.book);
+  add("done","Seen","at "+esc(clock(e.first_seen))+" on the odds page");
+  if(e.status==="confirmed") add("done","Still out of line","on the next read, a minute later"); else add("now","Reading again","in about a minute, to confirm it");
+  const at=e.book_t? ", checked at "+esc(clock(e.book_t)) : "";
+  if(v==="seen") add("done",B+"'s own site","shows the same price"+at);
+  else if(v==="moved") add("note",B+"'s own site","shows "+(e.book_price? Number(e.book_price).toFixed(2):"a different price")+at);
+  else if(v==="not shown") add("note",B+"'s own site","page found, price not read");
+  else if(v==="not listed") add("note",B+"'s own site","was read, this match was not on it"+at);
+  else if(v==="no page") add("note",B+"'s own site","no page for this match was found"+at);
+  else if(v==="blocked") add("note",B+"'s own site","its page would not open"+at);
+  else if(v==="unreadable"||v==="no site"||v==="no link") add("note",B+"'s own site","could not be reached");
+  else add("now","Checking "+B+"'s own site","through Context.dev");
+  if(e.in_record) add("done","Added to the record","with a screenshot as proof");
+  else if(e.backed) add("note","Already in the record","at "+e.backed.price.toFixed(2)+" with "+esc(e.backed.book));
+  else add("","Added to the record","once it is confirmed");
+  return "<div class='steps'>"+s.join("")+"</div>";
 }
 function renderLive(){
   const L=S.live;
-  if(!S.leagues.length && !S.pages.length){ $("live").innerHTML="<div class='quiet'><div><div class='big'>Nothing is being watched yet.</div>"+
+  if(!S.leagues.length && !S.pages.length){ $("live").html="<div class='quiet'><div><div class='big'>Nothing is being watched yet.</div>"+
     "<p>Stop the app, find matches, then start it again: <code>python app.py hub --deep</code> finds the coming matches and their odds pages, and <code>python app.py serve</code> starts Offside.</p></div></div>"; return; }
   if(!L.length){ const c=S.closest;
-    $("live").innerHTML="<div class='quiet'><div class='ghost' aria-hidden='true'></div><div><div class='big'>No price is out of line right now.</div>"+
+    $("live").html="<div class='quiet'><div class='ghost' aria-hidden='true'></div><div><div class='big'>Scanning. No price is out of line right now.</div>"+
     "<p>That is normal. In the tested leagues the medium rule fires once or twice a week, usually in the last minutes before kick-off.</p></div></div>"+
-    (c? "<article class='flagrow'><div class='fl-top'><div><div class='fl-match'>Closest right now: "+matchName(c)+scope(c)+"</div>"+
-      "<div class='fl-what' style='font-size:1.3rem'>"+who(c)+" at "+esc(c.book)+"</div>"+
-      "<div class='small' style='margin-top:4px'>Kick-off "+esc(until(c.kickoff,S.now))+", "+esc(day(c.kickoff))+"</div></div>"+
-      "<div class='fl-price'><div class='num' style='font-size:2rem;line-height:1.1'>"+c.price.toFixed(2)+"</div><div class='small'>would need to be above "+c.needed.toFixed(2)+"</div></div></div>"+
-      strip(c, true)+"<div class='small' style='margin-top:6px'>Each dot is one bookmaker's price for this result. A price inside the shaded band would be out of line.</div></article>" : ""); return; }
+    (c? "<article class='flagrow calm'><div class='fl-top'><div><div class='fl-match'>Closest right now: "+matchName(c)+scope(c)+", kick-off "+esc(until(c.kickoff,S.now))+"</div>"+
+      "<div class='fl-what' style='font-size:clamp(1.3rem,1.5vw,1.9rem)'><span>"+who(c)+" at</span><span>"+bkl(c.book, "", c.url)+"</span></div></div>"+
+      "<div class='fl-price'><div class='num' style='font-size:clamp(1.9rem,2.3vw,2.8rem);line-height:1.05;font-weight:700'>"+c.price.toFixed(2)+"</div><div class='by' style='font-weight:500;color:var(--muted)'>needs to be above "+c.needed.toFixed(2)+"</div></div></div>"+
+      strip(c, true)+"<div class='onpitch'>Each dot is one bookmaker's price for this result. A price beyond the dashed line would be out of line.</div></article>" : ""); return; }
   let h="";
   const order=L.slice().sort((x,y)=>((y.status==="confirmed")-(x.status==="confirmed")) || (y.price/y.average-x.price/x.average));
   const rest=order.slice(3);
   for(const e of order.slice(0,3)){ const k=e.mid+"|"+e.book+"|"+e.outcome, fresh=!first&&!seen.has(k); seen.add(k);
     const ev=S.evidence&&S.evidence.settings&&S.evidence.settings[String(e.points)];
-    h+="<article class='flagrow"+(fresh?" fresh":"")+"'><div class='fl-top'><div><div class='fl-match'>"+matchName(e)+scope(e)+"</div>"+
-    "<div class='fl-what'>"+who(e)+" at "+esc(e.book)+"</div>"+
-    "<div class='small' style='margin-top:4px'>Kick-off "+esc(until(e.kickoff,S.now))+", "+esc(day(e.kickoff))+"</div></div>"+
-    "<div class='fl-price'><span class='yc'>"+e.price.toFixed(2)+"</span><div class='small pos' style='font-weight:700'>+"+(100*(e.price/e.average-1)).toFixed(0)+"% above the rest</div></div></div>"+
-    strip(e)+
-    "<div class='fl-foot'>"+(e.book_link? "<a class='go' href='"+esc(e.book_link)+"' target='_blank' rel='noopener'>Bet at "+esc(e.book)+"</a>":"")+
-    (e.url? "<a class='lnk' href='"+esc(e.url)+"' target='_blank' rel='noopener'>"+(e.book_link?"all bookmakers' live prices":"open the live prices")+"</a>" : "")+
-    (e.status==="confirmed"?"<span class='tag ok'>confirmed</span>":"<span class='tag'>checking again in about a minute</span>")+
-    (e.verify? checked(e.verify, e.book_price):"")+"</div>"+
-    "<div class='small' style='margin-top:10px'>The rest average "+e.average.toFixed(2)+" and the rule needs above "+e.needed.toFixed(2)+". Passes the minus "+e.points+" setting"+
-    (ev? ", which returned "+(ev.roi>=0?"+":"")+(100*ev.roi).toFixed(0)+"% a bet in the test":"")+".</div>"+
-    (e.news?"<div class='small news'>"+esc(e.news)+"</div>":"")+"</article>"; }
+    h+="<article class='flagrow"+(fresh?" fresh":"")+"'><div class='fl-top'><div><div class='fl-match'>"+matchName(e)+scope(e)+", kick-off "+esc(until(e.kickoff,S.now))+"</div>"+
+    "<div class='fl-what'><span>"+who(e)+" at</span><span>"+bkl(e.book, e.book_link, e.url)+"</span></div></div>"+
+    "<div class='fl-price'><span class='yc'>"+e.price.toFixed(2)+"</span><div class='by'>+"+(100*(e.price/e.average-1)).toFixed(0)+"% above the rest</div></div></div>"+
+    strip(e)+steps(e)+
+    "<div class='fl-foot'>"+(e.book_link? "<a class='go' href='"+esc(e.book_link)+"' target='_blank' rel='noopener'>Bet at "+esc(e.book)+"</a>"+
+        (e.url? "<a class='lnk' href='"+esc(e.url)+"' target='_blank' rel='noopener'>all bookmakers' live prices</a>" : "") :
+      ((pageFor(e.book, e.url)? "<a class='go' href='"+esc(pageFor(e.book, e.url))+"' target='_blank' rel='noopener'>Bet at "+esc(e.book)+"</a><span class='small'>opens its page for this league, where the match is listed</span>" :
+        (site(e.book)? "<a class='go' href='"+esc(site(e.book))+"' target='_blank' rel='noopener'>Open "+esc(e.book)+"</a>" : ""))+
+       (e.url? "<a class='lnk' href='"+esc(e.url)+"' target='_blank' rel='noopener'>all bookmakers' live prices</a>" : "")))+"</div>"+
+    "<div class='onpitch'>The rest average "+e.average.toFixed(2)+" and the rule needs above "+e.needed.toFixed(2)+". Passes the minus "+e.points+" setting"+
+    (ev? ", which returned "+(ev.roi>=0?"+":"")+(100*ev.roi).toFixed(0)+"% a bet in the test":"")+"."+
+    (e.feed_t? " "+esc(e.book)+"'s price last changed on the odds site "+howlong(S.now-e.feed_t)+" ago.":"")+
+    ((e.avg0&&Math.abs(e.average/e.avg0-1)>0.004)? " Since it was first seen the rest have moved from "+e.avg0.toFixed(2)+" to "+e.average.toFixed(2)+", "+(e.average>e.avg0?"towards":"away from")+" "+esc(e.book)+"'s price.":"")+
+    ((e.kickoff&&e.kickoff-S.now>3*86400)? " Kick-off is more than 3 days away, which is earlier than the test covers.":"")+
+    (e.news? " "+esc(e.news):"")+"</div></article>"; }
   if(rest.length){
-    h+="<h3 style='margin:24px 0 10px'>"+rest.length+" more out of line</h3><div class='scroll'><table style='min-width:640px'><thead><tr><th>Match</th><th>Result and bookmaker</th><th>Price</th><th>The rest</th><th>Status</th></tr></thead><tbody>";
+    h+="<h3 style='margin:14px 0 0'>"+rest.length+" more out of line</h3><div class='scroll'><table style='min-width:640px'><thead><tr><th>Match</th><th>Result and bookmaker</th><th>Price</th><th>The rest</th><th>Status</th></tr></thead><tbody>";
     for(const e of rest){ const k=e.mid+"|"+e.book+"|"+e.outcome; seen.add(k);
-      h+="<tr><td class='m'><span class='match'>"+matchName(e)+"</span>"+scope(e)+"<div class='small'>kick-off "+esc(until(e.kickoff,S.now))+"</div></td>"+
-      "<td>"+who(e)+" at "+esc(e.book)+(e.book_link? "<div style='margin-top:6px'><a class='go' href='"+esc(e.book_link)+"' target='_blank' rel='noopener'>Bet at "+esc(e.book)+"</a></div>" :
+      h+="<tr><td class='m'><span class='match'>"+matchName(e)+"</span><div class='small'>kick-off "+esc(until(e.kickoff,S.now))+"</div></td>"+
+      "<td>"+who(e)+" at "+bkl(e.book, e.book_link, e.url)+(e.book_link? "<div style='margin-top:6px'><a class='go' href='"+esc(e.book_link)+"' target='_blank' rel='noopener'>Bet at "+esc(e.book)+"</a></div>" :
         (e.url? "<div class='small'><a href='"+esc(e.url)+"' target='_blank' rel='noopener'>open the live prices</a></div>":""))+"</td>"+
       "<td><span class='yc'>"+e.price.toFixed(2)+"</span></td>"+
       "<td><span class='num'>"+e.average.toFixed(2)+"</span><div class='small pos'>+"+(100*(e.price/e.average-1)).toFixed(0)+"% above</div></td>"+
-      "<td class='st'>"+(e.status==="confirmed"?"<span class='tag ok'>confirmed</span>":"<span class='tag'>checking again in about a minute</span>")+
-      (e.verify? "<div style='margin-top:5px'>"+checked(e.verify, e.book_price)+"</div>":"")+"</td></tr>"; }
+      "<td class='st'>"+(e.status==="confirmed"?"<span class='tag ok'>still out of line a minute later</span>":"<span class='tag warn'>reading again in about a minute</span>")+
+      (e.verify? "<div style='margin-top:5px'>"+checked(e.verify, e.book_price, e.book_t)+"</div>":"")+"</td></tr>"; }
     h+="</tbody></table></div>"; }
-  $("live").innerHTML=h; first=false;
+  $("live").html=h; first=false;
 }
 function renderAll(){
   const M=S.matches, extra=waitingRows();
-  $("allsub").textContent = M.length? "The bar shows how close the most generous price is to the line at the medium setting. A full bar means it is out of line." :
+  const fd=S.finding||{}, found = fd.state==="looking"? " Looking for new matches now." :
+    (fd.every? " New matches are looked for every "+fd.every+" hours"+(fd.t? ", last at "+clock(fd.t)+(fd.added!=null? " ("+fd.added+" added)":"") : "")+"." : "");
+  $("allsub").textContent = M.length? "The bar shows how close the most generous price is to the line at the medium setting. A full bar means it is out of line."+found :
     (S.pages.length? plural(S.pages.length,"match")+" saved. Prices appear as each one is read." : "No matches are being watched yet.");
-  if(!M.length && !extra){ $("all").innerHTML="<div class='setup small'>Nothing to show yet.</div>"; return; }
+  if(!M.length && !extra){ $("all").html="<div class='setup small'>Nothing to show yet.</div>"; return; }
   let h="<table><thead><tr><th>Kick-off</th><th>Match</th><th>Bookmakers</th><th>Average price: home, draw, away</th><th>Closest to the line</th><th>How it has moved</th></tr></thead><tbody>";
   for(const m of M){ const n=m.nearest; let c="<span class='small'>too few bookmakers to judge</span>";
     if(n){ const pct=Math.max(0,Math.min(1,(n.ratio-0.85)/0.15)); c="<div class='nw'><span class='meter"+(n.ratio>=1?" hot":"")+"'><i style='width:"+(100*pct).toFixed(0)+"%'></i></span>"+
       "<span class='num'>"+n.price.toFixed(2)+"</span> <span class='small'>needs above "+n.needed.toFixed(2)+"</span></div>"+
-      "<div class='small'>"+esc(n.book)+", "+names[n.outcome].toLowerCase()+"</div>"; }
+      "<div class='small'>"+bkl(n.book, "", m.url)+", "+names[n.outcome].toLowerCase()+"</div>"; }
     h+="<tr><td class='when'><span class='num'>"+esc(until(m.kickoff,S.now))+"</span><div class='small'>"+esc(day(m.kickoff))+"</div></td>"+
     "<td><span class='match'>"+matchName(m)+"</span>"+scope(m)+(m.in_play?" <span class='tag'>in play</span>":"")+"<div class='small'>"+esc(m.league)+", read "+esc(ago(m.read_t))+" at "+esc(clock(m.read_t))+"</div>"+
     ((m.kickoff&&m.kickoff>S.now)? (((S.read_note||{})[m.id]||{}).state==="reading"? "<button type='button' class='mini' disabled>Reading…</button>" :
       "<button type='button' class='mini' onclick='readNow("+JSON.stringify(m.id).replace(/'/g,"&#39;")+", this)'>Read now</button>"):"")+readNote(m)+"</td><td><span class='num'>"+m.books+"</span></td>"+
     "<td class='num nw'>"+(m.avg? m.avg.map(a=>a.toFixed(2)).join("&nbsp;&nbsp;&nbsp;"):"<span class='small'>n/a</span>")+"</td><td>"+c+"</td><td>"+spark(m.hist)+"</td></tr>"; }
-  $("all").innerHTML=h+extra+"</tbody></table>";
+  $("all").html=h+extra+"</tbody></table>";
 }
 function spark(h){
   // the average price (grey) and the best price on offer (yellow) over the last reads, for the result nearest the line
@@ -2185,7 +2853,7 @@ function spark(h){
   const X=v=>2+(v-x0)/(x1-x0)*(W-4), Y=v=>H-3-(y1===y0?0.5:(v-y0)/(y1-y0))*(H-6);
   const line=i=>h.map((p,j)=>(j?"L":"M")+X(p[0]).toFixed(1)+" "+Y(p[i]).toFixed(1)).join(" ");
   return "<svg class='spark' viewBox='0 0 "+W+" "+H+"' role='img' aria-label='Average and best price over the last reads'>"+
-    "<path d='"+line(1)+"' fill='none' stroke='var(--chart2)' stroke-width='1.6'/><path d='"+line(2)+"' fill='none' stroke='var(--card)' stroke-width='2'/></svg>"+
+    "<path d='"+line(1)+"' fill='none' stroke='var(--chart2)' stroke-width='1.6'/><path d='"+line(2)+"' fill='none' stroke='var(--card-line)' stroke-width='2'/></svg>"+
     "<div class='small'>"+h[0][1].toFixed(2)+" to "+h[h.length-1][1].toFixed(2)+" average</div>";
 }
 function waitingRows(){
@@ -2208,15 +2876,15 @@ function renderRecord(){
   if(c.n) t+=" Against the closing prices, "+c.beat+" of "+c.n+" recorded prices were still above the average at kick-off, by "+(100*c.edge).toFixed(1)+"% on average.";
   if(S.missed) t+=" "+plural(S.missed,"other price")+" "+(S.missed===1?"was":"were")+" out of line on one read and gone by the next, so "+(S.missed===1?"it is":"they are")+" not counted.";
   $("recsub").textContent=t;
-  if(!R.length){ $("record").innerHTML="<div class='setup small'>The record is empty.</div>"; return; }
+  if(!R.length){ $("record").html="<div class='setup small'>The record is empty.</div>"; return; }
   let h="<table><thead><tr><th>Confirmed</th><th>Match</th><th>Backed</th><th>Price taken</th><th>At kick-off</th><th>Outcome</th><th>Profit</th><th>Proof</th></tr></thead><tbody>";
   for(const r of R){ const out = r.result==="won"? "<span class='won'>Won "+esc(r.score)+"</span>" : r.result==="lost"? "<span class='rc'>Lost "+esc(r.score)+"</span>" : "<span class='small'>not finished</span>";
     const close = r.close_avg? "<span class='num'>"+r.close_avg.toFixed(2)+"</span><div class='small "+(r.price>r.close_avg?"pos":"neg")+"'>"+(r.price>r.close_avg?"still ":"")+((100*(r.price/r.close_avg-1))>=0?"+":"")+(100*(r.price/r.close_avg-1)).toFixed(0)+"% against the closing average</div>" :
       (r.close_avg===0? "<span class='small'>no read before kick-off</span>" : "<span class='small'>not kicked off</span>");
     h+="<tr><td class='when'>"+esc(day(r.t))+"<div class='small'>"+(r.kickoff? "kick-off "+esc(day(r.kickoff)):"")+"</div></td><td class='m'><span class='match'>"+matchName(r)+"</span>"+scope(r)+
-    (r.verify?"<div style='margin-top:4px'>"+checked(r.verify, r.source_price)+"</div>":"")+
+    (r.verify?"<div style='margin-top:4px'>"+checked(r.verify, r.source_price, r.verify_t)+"</div>":"")+
     (r.news?"<div class='small' style='max-width:34ch;margin-top:4px'>"+esc(r.news)+"</div>":"")+"</td>"+
-    "<td>"+names[r.outcome]+"<div class='small'>at "+esc(r.book)+"</div><div class='small'>"+(r.stake? "stake "+r.stake.toFixed(2):"")+", passes minus "+r.points+"</div>"+
+    "<td>"+names[r.outcome]+"<div style='margin:3px 0'>"+bkl(r.book, r.link!==r.url? r.link : "", r.url)+"</div><div class='small'>"+(r.stake? "stake "+r.stake.toFixed(2):"")+", passes minus "+r.points+"</div>"+
     "</td>"+
     "<td><span class='num'>"+r.price.toFixed(2)+"</span><div class='small'>average then "+r.average.toFixed(2)+"</div></td><td>"+close+"</td><td>"+out+"</td>"+
     "<td><span class='num "+(r.profit>0?"pos":r.profit<0?"neg":"")+"'>"+(r.profit==null?"":(r.profit>0?"+":"")+(r.profit*(r.stake||1)).toFixed(2))+"</span>"+
@@ -2224,36 +2892,57 @@ function renderRecord(){
     "<td>"+(r.shot? "<a href='/proof/"+esc(r.shot)+"' target='_blank' rel='noopener'><img class='thumb' src='/proof/"+esc(r.shot)+"' alt='Screenshot of the odds page when this price was recorded'></a>":"")+
     (r.proof? "<a class='small' href='/proof/"+esc(r.proof)+"' target='_blank' rel='noopener'>saved page</a>":"<span class='small'>none</span>")+
     (r.request_id? "<div class='small'>Context.dev request "+esc(r.request_id.slice(0,8))+"</div>":"")+"</td></tr>"; }
-  $("record").innerHTML=h+"</tbody></table>";
+  $("record").html=h+"</tbody></table>";
 }
+let seenShow="all";
 function renderSeen(){
   const L=S.seen||[];
-  if(!L.length){ $("seen").innerHTML="<div class='setup small'>Nothing has been out of line yet.</div>"; return; }
+  if(!L.length){ $("seen").html="<div class='setup small'>Nothing has been out of line yet.</div>"; $("seenseg").html=""; return; }
   const dur=s=>{const d=s.last-s.first; return s.reads<2? "one read" : (d<90? "about a minute" : (d<3600? Math.round(d/60)+" min" : (d/3600).toFixed(1)+" h"));};
-  let h="<table><thead><tr><th>First seen</th><th>Match</th><th>Result</th><th>Bookmaker</th><th>Best price</th><th>Average</th><th>Lasted</th><th>What happened</th></tr></thead><tbody>";
-  for(const s of L){ const live=S.now-s.last<420 && (!s.kickoff || s.kickoff>S.now);
-    h+="<tr><td class='when'>"+esc(day(s.first))+"</td><td class='m'><span class='match'>"+esc(s.match)+"</span></td><td class='nw'>"+names[s.outcome]+"</td><td class='nw'>"+esc(s.book)+"</td>"+
-    "<td><span class='num'>"+s.price.toFixed(2)+"</span><div class='small pos'>+"+(100*(s.price/s.average-1)).toFixed(0)+"% above the average</div></td>"+
+  const liveNow=new Set((S.live||[]).map(e=>e.home+" v "+e.away+"|"+e.book+"|"+e.outcome));
+  const kind=s=> s.recorded? "in" : (s.reads>=2&&s.backed)? "dup" : liveNow.has(s.match+"|"+s.book+"|"+s.outcome)? "now" : "no";
+  const count={in:0,dup:0,now:0,no:0}; for(const s of L) count[kind(s)]++;
+  $("seensub").textContent=count.in+" of "+L.length+" went into the record: each was still out of line a minute later."+
+    (count.dup? " "+count.dup+" more passed the same test for a result that was already in the record.":"")+" The rest were not counted.";
+  $("seenseg").html=[["all","All "+L.length],["in","In the record "+count.in],["no","Not counted "+(count.no+count.dup)]].map(o=>
+    "<button type='button' data-show='"+o[0]+"' aria-pressed='"+(seenShow===o[0])+"'>"+o[1]+"</button>").join("");
+  for(const bt of document.querySelectorAll("#seenseg button")) bt.onclick=()=>{ seenShow=bt.dataset.show; renderSeen(); };
+  const pill={in:"<span class='pill in'>In the record</span>", dup:"<span class='pill dup'>Passed, not added again</span>", now:"<span class='pill now'>Out of line now</span>", no:"<span class='pill no'>Not counted</span>"};
+  let h="<table><thead><tr><th>Counted?</th><th>First seen</th><th>Match</th><th>Result</th><th>Bookmaker</th><th>Best price</th><th>The rest averaged</th><th>Lasted</th><th>What happened</th></tr></thead><tbody>", shown=0;
+  for(const s of L){ const n=s.end||{}, kd=kind(s); let what;
+    if(seenShow==="in"&&kd!=="in") continue;
+    if(seenShow==="no"&&(kd==="in"||kd==="now")) continue;
+    shown++;
+    if(kd==="in") what="Still out of line a minute later, so it was added to the record.";
+    else if(kd==="no"&&s.early) what="First seen more than "+S.window_h+" hours before kick-off, which is outside the window, so it is not counted.";
+    else if(kd==="dup") what="Still out of line a minute later. Not added again: this result is already in the record at "+s.backed.price.toFixed(2)+" with "+esc(s.backed.book)+".";
+    else if(kd==="now") what="Being read again to confirm it.";
+    else if(n.why==="caught") what="A minute later the other bookmakers had moved towards it. At "+Number(n.price_now).toFixed(2)+" it was no longer out of line"+(n.needed_now? ", which needed above "+Number(n.needed_now).toFixed(2):"")+".";
+    else if(n.why==="cut") what="A minute later "+esc(s.book)+" had cut the price to "+Number(n.price_now).toFixed(2)+".";
+    else if(n.why==="removed") what="A minute later "+esc(s.book)+" was no longer offering a price.";
+    else if(n.why==="kickoff") what="The match kicked off before it could be read again.";
+    else if(s.reads>=2) what="Seen on "+s.reads+" reads, not added to the record.";
+    else what="It was no longer out of line on the next read, a minute later.";
+    h+="<tr class='"+(kd==="in"?"inrec":kd==="no"?"notin":"")+"'><td class='nw'>"+pill[kd]+"</td><td class='when'>"+esc(day(s.first))+"</td><td class='m'><span class='match'>"+esc(s.match)+"</span></td><td class='nw'>"+names[s.outcome]+"</td><td class='nw'>"+bkl(s.book, s.book_link, s.url)+"</td>"+
+    "<td><span class='num'>"+s.price.toFixed(2)+"</span><div class='small pos'>+"+(100*(s.price/s.average-1)).toFixed(0)+"% above the rest</div></td>"+
     "<td><span class='num'>"+s.average.toFixed(2)+"</span><div class='small'>passes minus "+s.points+"</div></td><td class='nw'>"+dur(s)+"<div class='small'>"+plural(s.reads,"read")+"</div></td>"+
-    "<td class='st' style='min-width:230px;max-width:300px;white-space:normal'>"+(s.recorded? "<span class='tag ok' style='white-space:normal'>confirmed and added to the record</span>" :
-      (s.reads>=2&&s.backed)? "<span class='tag ok'>confirmed</span><div class='small' style='margin-top:4px'>Not added again: this result is already in the record at "+s.backed.price.toFixed(2)+" with "+esc(s.backed.book)+".</div>" :
-      live? "<span class='tag'>still out of line</span>" :
-      s.reads>=2? "<span class='tag'>seen on "+s.reads+" reads, not added to the record</span>" : "<span class='tag'>gone before it could be confirmed</span>")+
-      (s.verify? "<div style='margin-top:4px'>"+checked(s.verify, s.book_price).replace("class='tag", "style='white-space:normal' class='tag")+"</div>":"")+"</td></tr>"; }
-  $("seen").innerHTML=h+"</tbody></table>";
+    "<td class='st'><div class='small' style='max-width:44ch'>"+what+"</div>"+(s.verify? "<div style='margin-top:5px'>"+checked(s.verify, s.book_price, s.book_t)+"</div>":"")+"</td></tr>"; }
+  $("seen").html= shown? h+"</tbody></table>" : "<div class='setup small'>Nothing in this group yet.</div>";
 }
+let feedTop="";
 function renderFeed(){
   const F=S.feed||[];
-  if(!F.length){ $("feed").innerHTML="<p class='small' style='margin:8px 0'>Reads appear here as they happen.</p>"; return; }
-  $("feed").innerHTML=F.map(f=>"<div class='fd"+(f.ok?"":" bad")+"'><i></i><div><b>"+esc(f.match)+"</b><span class='t'>"+esc(clock(f.t))+"</span>"+
-    "<div class='small'>"+(f.ok? f.books+" bookmakers in "+f.secs.toFixed(1)+" s"+(f.fresh?", fresh from the site":"")+(f.method? ", via "+esc(f.method):"") : "read failed after "+f.secs.toFixed(1)+" s")+
-    (f.request_id? ", request "+esc(f.request_id.slice(0,8)):"")+"</div></div></div>").join("");
+  if(!F.length){ $("feed").html="<div class='lg'><span class='t'></span><span class='d' style='grid-column:2/-1'>Reads appear here as they happen.</span></div>"; return; }
+  const top=F[0].t+"|"+F[0].match, isNew=feedTop!=="" && top!==feedTop; feedTop=top;
+  $("feed").html=F.map((f,i)=>"<div class='lg"+(f.ok?"":" bad")+(i===0&&isNew?" in":"")+"'><span class='t'>"+esc(clock(f.t))+"</span><span class='m' title='"+esc(f.match)+"'>"+esc(f.match)+"</span>"+
+    "<span class='d'>"+(f.ok? "<b>"+f.books+" bookmakers</b> in "+f.secs.toFixed(1)+" s"+(f.fresh?", fresh":"")+(f.method? ", via "+esc(f.method):"") : "<b>read failed</b> after "+f.secs.toFixed(1)+" s")+"</span>"+
+    "<span class='r'>"+(f.request_id? "request "+esc(f.request_id.slice(0,8)):"")+"</span></div>").join("");
 }
 function renderPot(){
-  const p=S.pot; if(!p){ $("paper").innerHTML=""; return; }
+  const p=S.pot; if(!p){ $("paper").html=""; return; }
   const d=p.now-p.start, money=x=>x.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
   const on=S.alerts&&(S.alerts.ntfy||S.alerts.webhook||S.alerts.sms);
-  $("paper").innerHTML="<div><b>"+money(p.now)+"</b><span>the bank now, from a start of "+money(p.start)+"</span></div>"+
+  $("paper").html="<div><b>"+money(p.now)+"</b><span>the bank now, from a start of "+money(p.start)+"</span></div>"+
     "<div><b class='"+(d>0?"pos":d<0?"neg":"")+"'>"+(d>=0?"+":"")+money(d)+"</b><span>profit or loss on finished matches</span></div>"+
     "<div><b>"+p.open_bets+"</b><span>still to finish, "+money(p.open)+" staked</span></div>"+
     "<div><b>"+p.stake_pct+"%</b><span>of the bank on every confirmed price</span></div>"+
@@ -2268,31 +2957,35 @@ function readNote(m){ const n=(S.read_note||{})[m.id]; if(!n) return "";
   if(n.state==="reading") return "<div class='small' style='color:var(--ink)'>Reading this page through Context.dev now. It usually takes 10 to 20 seconds.</div>";
   if(n.state==="done") return "<div class='small' style='color:var(--win);font-weight:600'>Read at "+esc(clock(n.t))+": "+n.books+" bookmakers in "+n.secs.toFixed(1)+" s.</div>";
   return "<div class='small' style='color:var(--loss);font-weight:600'>Read failed: "+esc(n.why||"")+"</div>"; }
+function howlong(s){ s=Math.max(0,Math.round(s)); return s<90? s+" s" : s<5400? Math.round(s/60)+" min" : s<172800? Math.floor(s/3600)+" h "+Math.floor(s%3600/60)+" min" : Math.round(s/86400)+" days"; }
 function ago(t){ const d=Math.max(0,Math.round(S.now-t)); return d<90? d+" s ago" : Math.round(d/60)+" min ago"; }
+let workKey="";
 function renderWork(){
-  const s=S.stats||{}; if(!s.pages){ $("workcard").style.display="none"; return; }
-  $("workcard").style.display="";
-  const cell=(n,l)=>"<div><b>"+Number(n||0).toLocaleString()+"</b><span>"+l+"</span></div>";
-  $("work").innerHTML=cell(s.pages,"odds pages read through Context.dev")+cell(s.prices,"bookmaker prices read from them")+
-    cell((S.seen||[]).length,"prices seen out of line")+cell(S.summary.recorded,"confirmed and recorded")+cell(s.screenshots,"proof screenshots")+cell(s.news,"team-news searches")+
-    (s.credits!=null? cell(s.credits,"Context.dev credits left"):"")+
-    "<div style='grid-column:span 2'><b style='font-size:1.3rem;white-space:nowrap'>"+esc(day(s.since))+"</b><span>running since</span></div>";
+  const s=S.stats||{}; if(!s.pages){ $("work").style.display="none"; return; }
+  $("work").style.display="";
+  const items=[["pages",s.pages,"odds pages read through Context.dev"],["prices",s.prices,"bookmaker prices read from them"],["seen",(S.seen||[]).length,"prices seen out of line"],
+    ["rec",S.summary.recorded,"confirmed and recorded"],["shots",s.screenshots,"proof screenshots"],["news",s.news,"team-news searches"]];
+  const key=items.map(x=>x[0]).join();
+  if(key!==workKey){ workKey=key; $("work").innerHTML=items.map(x=>"<div class='kpi'><b data-k='"+x[0]+"'>0</b><span>"+x[2]+"</span></div>").join("")+
+    "<div class='kpi'><b class='plain' id='since'></b><span>running since</span></div>"; }
+  for(const x of items) tween($("work").querySelector("[data-k='"+x[0]+"']"), Number(x[1]||0));
+  $("since").textContent=day(s.since);
 }
 function renderEvidence(){
   const E=S.evidence;
   if(!E || !E.settings || !Object.keys(E.settings).length || !E.split){ $("evsub").textContent="The chart has not been built yet (or was built by an older version). Stop the app and run: python app.py evidence";
-    $("switch").innerHTML=""; $("figs").innerHTML=""; $("chart").innerHTML=""; $("basel").textContent=""; $("tnote").textContent="";
-    $("seasons").innerHTML=""; $("pot").innerHTML=""; $("seasnote").textContent=""; $("yieldnote").textContent=""; return; }
+    $("switch").html=""; $("figs").html=""; $("chart").html=""; $("basel").textContent=""; $("tnote").textContent="";
+    $("seasons").html=""; $("pot").html=""; $("seasnote").textContent=""; $("yieldnote").textContent=""; return; }
   $("evsub").textContent="Tested on "+E.matches.toLocaleString()+" matches in "+E.leagues+" European leagues, "+E.first.slice(0,4)+" to "+E.last.slice(0,4)+
     ", using only mainstream bookmakers named in the data.";
-  $("basel").textContent="Betting every result at the average price over the same matches lost "+Math.abs(100*E.baseline_roi).toFixed(1)+"%. That is the bookmakers' margin.";
+  $("basel").textContent="Betting everything at the average price lost "+Math.abs(100*E.baseline_roi).toFixed(1)+"% a bet.";
   const labels={"3":"Loose: minus 3","4":"Medium: minus 4","5":"Strict: minus 5"};
   if(!E.settings[setting]) setting=Object.keys(E.settings)[0];
   $("switch").innerHTML=Object.keys(E.settings).map(k=>"<button type='button' aria-pressed='"+(k===setting)+"' data-k='"+k+"'>"+labels[k]+"</button>").join("");
   for(const b of $("switch").querySelectorAll("button")) b.onclick=()=>{setting=b.dataset.k; renderEvidence();};
   const s=E.settings[setting], pc=x=>x==null?"n/a":(x>=0?"+":"")+(100*x).toFixed(1)+"%", sp=E.split.slice(0,2)+"/"+E.split.slice(2);
   const bank=(s.pot||[])[0], perYear=s.years? s.bets/s.years : null;
-  $("figs").innerHTML="<div><b class='pos'>"+pc(s.roi)+"</b><span>return on every bet, on the money staked. It is not a yearly figure</span></div>"+
+  $("figs").html="<div><b class='pos'>"+pc(s.roi)+"</b><span>return on every bet, on the money staked. It is not a yearly figure</span></div>"+
     (s.units!=null? "<div><b>"+(s.units>=0?"+":"")+Math.round(s.units)+"</b><span>units of profit in total over "+s.years+" years, staking 1 unit a bet</span></div>":"")+
     (bank? "<div><b>"+(bank.per_year_pct>=0?"+":"")+Math.round(bank.per_year_pct)+"%</b><span>a year on average, on a bank of 1,000 staking "+bank.stake+" a bet</span></div>":"")+
     "<div><b>"+s.bets.toLocaleString()+"</b><span>bets"+(perYear? ", about "+Math.round(perYear)+" a year":"")+"</span></div>";
@@ -2300,13 +2993,13 @@ function renderEvidence(){
     (s.t==null? "" : " The t statistic is "+s.t.toFixed(1)+", and above 2 means the result is unlikely to be luck. It won "+(100*s.win).toFixed(0)+"% of bets at average odds of "+s.avg_odds.toFixed(2)+".");
   drawChart(s.series, E.split_month, sp);
   $("yieldnote").textContent="This setting returned "+pc(s.roi)+" per bet. A return of 2% to 5% per bet is usually thought of as a good long-run result for a professional.";
-  if(!s.seasons){ $("seasons").innerHTML=""; $("pot").innerHTML=""; $("seasnote").textContent="Run: python app.py evidence, to add the season table."; return; }
+  if(!s.seasons){ $("seasons").html=""; $("pot").html=""; $("seasnote").textContent="Run: python app.py evidence, to add the season table."; return; }
   $("seasnote").textContent=s.winning_seasons+" of "+s.n_seasons+" seasons made money. Bars show each season's profit in units, one unit staked per bet. A single season has few bets, so it is noisy.";
   drawSeasons(s.seasons);
   let h="<div class='scroll'><table style='min-width:0'><thead><tr><th>Stake per bet</th><th>Profit over "+s.years+" years</th><th>Average a year on the bank</th><th>Worst season</th></tr></thead><tbody>";
   for(const r of s.pot) h+="<tr><td><span class='num'>"+r.stake+"</span> <span class='small'>("+r.stake_pct+"% of the bank)</span></td><td><span class='num pos'>"+(r.total>=0?"+":"")+r.total.toLocaleString()+"</span></td>"+
     "<td><span class='num pos'>"+(r.per_year_pct>=0?"+":"")+r.per_year_pct+"%</span></td><td><span class='num neg'>"+r.worst_season.toLocaleString()+"</span></td></tr>";
-  $("pot").innerHTML=h+"</tbody></table></div><p class='small' style='margin:8px 0 0'>Flat stakes, no compounding, from the test. It assumes the recorded price was available every time and the account was never limited.</p>";
+  $("pot").html=h+"</tbody></table></div><p class='small' style='margin:8px 0 0'>Flat stakes, no compounding, from the test. It assumes the recorded price was available every time and the account was never limited.</p>";
 }
 function drawSeasons(rows){
   const W=820,H=230,L=46,R=10,T=18,B=44, n=rows.length, vals=rows.map(r=>r.units).concat([0]);
@@ -2318,10 +3011,10 @@ function drawSeasons(rows){
        "<text x='"+(x+w/2).toFixed(1)+"' y='"+(r.units>=0? y-5 : y+h+13).toFixed(1)+"' text-anchor='middle' font-size='12' fill='var(--ink)'>"+(Math.round(r.units)>0?"+":"")+Math.round(r.units)+"</text>"+
        "<text x='"+(x+w/2).toFixed(1)+"' y='"+(H-24)+"' text-anchor='middle' font-size='12' fill='var(--muted)'>"+esc(r.season)+"</text>"+
        "<text x='"+(x+w/2).toFixed(1)+"' y='"+(H-9)+"' text-anchor='middle' font-size='11' fill='var(--muted)'>"+r.bets+" bets</text>"; });
-  $("seasons").innerHTML="<svg viewBox='0 0 "+W+" "+H+"' role='img' aria-label='Profit in units by season'>"+g+"</svg>";
+  $("seasons").html="<svg viewBox='0 0 "+W+" "+H+"' role='img' aria-label='Profit in units by season'>"+g+"</svg>";
 }
 function drawChart(series, splitMonth, sp){
-  if(!series.length){ $("chart").innerHTML=""; return; }
+  if(!series.length){ $("chart").html=""; return; }
   const W=820,H=360,L=50,R=16,T=24,B=32;
   const tx=ym=>{const p=ym.split("-"); return +p[0]+(+p[1]-1)/12;};
   const xs=series.map(p=>tx(p[0])), x0=Math.min(...xs), x1=Math.max(...xs)+0.01;
@@ -2335,7 +3028,7 @@ function drawChart(series, splitMonth, sp){
   for(let yr=Math.ceil(x0); yr<=x1; yr++){ g+="<text x='"+X(yr)+"' y='"+(H-9)+"' text-anchor='middle' font-size='13' fill='var(--muted)'>"+yr+"</text>"; }
   if(splitMonth){ const sx=X(tx(splitMonth)); g+="<line x1='"+sx+"' x2='"+sx+"' y1='"+T+"' y2='"+(H-B)+"' stroke='var(--muted)' stroke-dasharray='4 4' stroke-width='1'/>"+
     "<text x='"+(sx+7)+"' y='"+(T+12)+"' font-size='13' fill='var(--muted)'>newer seasons, from "+sp+"</text>"; }
-  $("chart").innerHTML="<svg viewBox='0 0 "+W+" "+H+"' role='img' aria-label='Running profit in units, month by month'>"+g+
+  $("chart").html="<svg viewBox='0 0 "+W+" "+H+"' role='img' aria-label='Running profit in units, month by month'>"+g+
     "<path d='"+path(2)+"' fill='none' stroke='var(--chart2)' stroke-width='2.2' stroke-linejoin='round'/>"+
     "<path d='"+path(1)+"' fill='none' stroke='var(--win)' stroke-width='3' stroke-linejoin='round'/>"+
     "<text x='"+L+"' y='"+(T-8)+"' font-size='13' fill='var(--muted)'>Running profit in units, one unit staked per bet</text></svg>";
@@ -2352,7 +3045,7 @@ function browserAlerts(){
     const who={home:e.home+" to win",draw:"The draw",away:e.away+" to win"}[e.outcome];
     const n=new Notification((e.status==="confirmed"?"Confirmed: ":"Out of line: ")+e.home+" v "+e.away,
       {body: who+" at "+e.book+": "+e.price.toFixed(2)+", everyone else averages "+e.average.toFixed(2)+(e.status==="confirmed"?". Added to the system's record.":". Checking again in a minute."), tag:k});
-    if(e.url) n.onclick=()=>{ window.open(e.url,"_blank"); n.close(); }; }
+    const to=e.book_link||pageFor(e.book, e.url)||site(e.book)||e.url; if(to) n.onclick=()=>{ window.open(to,"_blank"); n.close(); }; }
   alertsReady=true;
 }
 $("notif").addEventListener("click", async ()=>{ try{ await Notification.requestPermission(); }catch(e){} browserAlerts();
@@ -2364,9 +3057,35 @@ $("settle").addEventListener("click", async ()=>{ $("settlemsg").textContent="Lo
   setTimeout(tick, 15000); setTimeout(tick, 40000); setTimeout(tick, 70000); });
 const PAGE_VERSION="VERSION_HERE";
 async function tick(){ try{ const r=await fetch("/api/state"); S=await r.json(); renderStatus(); renderLive(); renderAll(); if(S.version && S.version!==PAGE_VERSION){ location.reload(); return; }
-  renderRecord(); renderPot(); renderFeed(); renderSeen(); renderWork(); renderEvidence(); browserAlerts(); }
+  renderRecord(); renderPot(); renderFeed(); renderSeen(); renderWork();
+  $("herosub").textContent="One bookmaker paying clearly more than all the others for the same result. A price has to still be out of line a minute later before it counts."+
+    (S.window_h? " Only matches kicking off within "+S.window_h+" hours are flagged." : ""); renderEvidence(); renderJoin(); browserAlerts(); }
   catch(e){ $("status").innerHTML="<span class='pill warn'><span class='dot off'></span>The scanner is not answering. Is app.py still running?</span>"; } }
 
+function look(v){ document.documentElement.dataset.theme=v; $("theme").textContent = v==="light"? "Dark look" : "Light look"; try{ localStorage.setItem("offside-look", v); }catch(e){} }
+try{ look(localStorage.getItem("offside-look")==="light"? "light" : "dark"); }catch(e){ look("dark"); }
+$("theme").addEventListener("click", ()=>look(document.documentElement.dataset.theme==="light"? "dark" : "light"));
+function renderJoin(){
+  const inv=S.invite||"";
+  $("join").hidden=!inv; if(inv) $("join").href=inv;
+  $("joinbox").html = inv? "<a class='go' href='"+esc(inv)+"' target='_blank' rel='noopener'>Join the Discord</a>" :
+    "<span class='small'>The join button appears here once an invite link is set: start the app with --invite and the link.</span>";
+  const s=(S.seen||[])[0];
+  const d = s? s : {match:"Romania v Poland", outcome:"away", book:"Star Sports", price:1.73, average:1.64, first:S.now, recorded:true, verify:"seen", sample:true};
+  const tm=d.match.split(" v "), who=d.outcome==="home"? tm[0]+" to win" : d.outcome==="away"? (tm[1]||"")+" to win" : "The draw";
+  const gone=!d.recorded && !(d.reads>=2&&d.backed) && d.end, ok=d.recorded||(d.reads>=2&&d.backed);
+  const L=["Seen on the odds page at "+clock(d.first)];
+  L.push(ok? "Still out of line a minute later" : gone? "No longer out of line a minute later" : "Reading again in about a minute");
+  if(d.verify==="seen") L.push("Same price on "+d.book+"'s own site"); else if(d.verify==="moved") L.push(d.book+"'s own site shows "+(d.book_price? Number(d.book_price).toFixed(2):"a different price")+" now");
+  if(d.recorded) L.push("Added to the record");
+  $("dclabel").textContent = d.sample? "An example of an alert, as it appears in Discord" : "The latest alert, as it appears in Discord";
+  $("dcprev").className="dc"+(ok?" ok":gone?" off":"");
+  $("dcprev").html="<div class='who'>Offside <i>APP</i><span>"+esc(clock(d.first))+"</span></div>"+
+    "<div class='tt'>"+esc(who)+" at "+esc(d.book)+": "+d.price.toFixed(2)+"</div>"+
+    "<p><b>"+esc(d.match)+"</b><br>Everyone else averages <b>"+d.average.toFixed(2)+"</b>. This is <b>+"+(100*(d.price/d.average-1)).toFixed(0)+"%</b> above them.</p>"+
+    "<div class='ln'>"+esc(L.join(String.fromCharCode(10)))+"</div><div class='lk'>Open "+esc(d.book)+"<br>All bookmakers' prices</div>";
+}
+let rz=null; window.addEventListener("resize", ()=>{ clearTimeout(rz); rz=setTimeout(()=>{ if(S){ first=true; renderLive(); } }, 150); });
 tick(); setInterval(tick, 5000);
 </script></body></html>
 """
@@ -2395,6 +3114,15 @@ def make_handler(engine):
             self._send(404, "not found", "text/plain")
 
         def do_POST(self):
+            now_ = time.time()
+            if getattr(engine, "public", False):                      # shared with strangers: nothing can be added, and the buttons are paced
+                if self.path == "/api/watch":
+                    return self._send(403, json.dumps({"ok": False, "error": "Adding pages is switched off on the shared dashboard."}), "application/json")
+                gap = 60 if self.path == "/api/settle" else 8
+                last = engine.paced.get(self.path, 0)
+                if now_ - last < gap:
+                    return self._send(200, json.dumps({"ok": False, "error": "One at a time: try again in a few seconds."}), "application/json")
+                engine.paced[self.path] = now_
             if self.path == "/api/settle":
                 return self._send(200, json.dumps({"ok": True, "checking": engine.check_results()}), "application/json")
             if self.path == "/api/read":
@@ -2420,8 +3148,31 @@ def make_handler(engine):
     return H
 
 
+def find_matches(engine, log=None):
+    """Look for new matches the way the last `hub` command did (the full league-by-league sweep if that was used)."""
+    hubs = load("hubs.json", [])
+    if not hubs or not engine.ctx_key:
+        return 0
+    o = load("hub_opts.json", {})
+    deep = o.get("deep", DEFAULT_HUB in hubs)                      # the football front page means the league-by-league sweep
+    within = o.get("within_h") or (200 if deep else 30)
+    engine.finding = {"state": "looking", "t": time.time()}
+    try:
+        added = run_hub(engine, engine.ctx_key, hubs, log=log or (lambda *a: None), research=False, workers=2, deep=deep, within_h=within, limit=150 if deep else 40)
+    except Exception as e:
+        engine.finding = {"state": "failed", "t": time.time(), "why": str(e)[:140]}
+        print("  %s  looking for new matches failed: %s" % (time.strftime("%H:%M:%S"), str(e)[:140]))
+        return 0
+    engine.finding = {"state": "done", "t": time.time(), "added": added, "deep": deep, "within_h": within}
+    save("hub_opts.json", dict(o, deep=deep, within_h=within, last=time.time(), added=added))
+    print("  %s  looked for new matches%s: %d added, %d watched in total" % (time.strftime("%H:%M:%S"), " on every league page" if deep else "", added, len(engine.watch)))
+    return added
+
+
 def run_loop(engine, stop, rediscover_hours=0):
-    last_find = time.time()
+    last_find = (load("hub_opts.json", {}) or {}).get("last") or 0   # when matches were last looked for, by this app or by `hub`
+    if last_find: engine.finding = {"state": "done", "t": last_find, "added": (load("hub_opts.json", {}) or {}).get("added")}
+    engine.find_every = rediscover_hours
     while not stop.is_set():
         try:
             engine.cycle()
@@ -2430,11 +3181,10 @@ def run_loop(engine, stop, rediscover_hours=0):
                 print("  %s  read %d source(s): %d matches on the board, %d out of line, %d recorded%s" % (
                     time.strftime("%H:%M:%S"), engine.reads, len(engine.matches), len(engine.live), len(engine.record),
                     ("  | %d could not be read" % len(bad)) if bad else ""))
-            hubs = load("hubs.json", [])
-            if rediscover_hours and hubs and engine.ctx_key and time.time() - last_find > rediscover_hours * 3600:
+            if rediscover_hours and engine.ctx_key and load("hubs.json", []) and time.time() - last_find > rediscover_hours * 3600:
                 last_find = time.time()
                 print("  %s  looking for new matches in the background ..." % time.strftime("%H:%M:%S"))
-                threading.Thread(target=lambda: run_hub(engine, engine.ctx_key, hubs, log=lambda *a: None, research=False, workers=2), daemon=True).start()
+                threading.Thread(target=find_matches, args=(engine,), daemon=True).start()
         except Exception as e:
             print("  scan pass failed: %s" % e)
         if not engine.backlog:
@@ -2444,7 +3194,7 @@ def run_loop(engine, stop, rediscover_hours=0):
 
 # --------------------------------------------------------------------------- self-test
 def selftest():
-    held = {k: os.environ.pop(k) for k in ("OFFSIDE_WEBHOOK", "OFFSIDE_NTFY", "OFFSIDE_SMS_TO", "TWILIO_SID", "TWILIO_TOKEN", "TWILIO_FROM") if k in os.environ}
+    held = {k: os.environ.pop(k) for k in ("OFFSIDE_WEBHOOK", "OFFSIDE_RESULTS_WEBHOOK", "OFFSIDE_NTFY", "OFFSIDE_SMS_TO", "TWILIO_SID", "TWILIO_TOKEN", "TWILIO_FROM") if k in os.environ}
     try:
         return _selftest()
     finally:
@@ -2532,6 +3282,21 @@ def _selftest():
               and n4_ == 1 and list(posted_[0]) == ["content"] and posted_[0]["content"].endswith("https://x")))
     C.append(("with no alert address set nothing is sent", notify("a", "b", post=lambda u, pl: sent_.append(1)) == 0))
     C.append(("'Check results now' queues finished matches for a lookup", isinstance(e.check_results(), int) and e.wake.is_set()))
+    rp_ = result_payload(dict(e.record[0]), {"finished": 1, "won": 1, "bank": 1035.0, "start": 1000.0})
+    C.append(("a finished match makes a result card with the score, the money and the record so far",
+              rp_["embeds"][0]["title"].startswith("Won: Alpha FC v Beta United") and "Profit 35.00" in rp_["embeds"][0]["description"]
+              and "1 finished, 1 won" in rp_["embeds"][0]["description"] and rp_["embeds"][0]["color"] == 0x3DF2A4))
+    got_ = []
+    e.result_card = lambda payload: (got_.append(payload["content"]), "id1")[1]
+    e._post_results(); e._post_results()
+    C.append(("each result is posted once", len(got_) == 1 and got_[0].startswith("Won:") and e.record[0].get("result_posted") is True))
+    os.environ["OFFSIDE_RESULTS_WEBHOOK"] = "https://discord.invalid/api/webhooks/2/def"
+    try:
+        e._post_results(); e._post_results()
+    finally:
+        os.environ.pop("OFFSIDE_RESULTS_WEBHOOK", None)
+    C.append(("when a results channel is set later, results already sent elsewhere are sent to it once", len(got_) == 2 and e.record[0].get("result_posted") == results_tag() or
+              (len(got_) == 2 and isinstance(e.record[0].get("result_posted"), str))))
     C.append(("the paper account stakes 2% of the pot and pays out at the recorded price", e.record[0]["stake"] == 20.0 and abs(pot_["now"] - (1000 + 20 * 1.75)) < 0.01 and pot_["open_bets"] == 0))
     C.append(("the dashboard data adds up and can be sent as JSON", st["summary"]["settled"] == 1 and st["summary"]["won"] == 1 and abs(st["summary"]["roi"] - 1.75) < 1e-9 and json.dumps(st)))
     page = ("# Gamma Town vs Delta City 1X2\n| bet365 | 2.30 | 3.40 | 3.00 |\n| William Hill | 2.25 | 3.30 | 3.10 |\n| Unibet | 2.35 | 3.45 | 2.95 |\n"
@@ -2564,7 +3329,135 @@ def _selftest():
     s10 = e10.state()["seen"][0]
     C.append(("the earlier log carries what the bookmaker's own site showed", s10.get("verify") == "seen" and s10.get("book_link", "").endswith("/event/123") and s10["recorded"]))
     fld_ = e10.state()["live"][0]["field"]
+    C.append(("the board says when matches were last looked for", "finding" in e10.state() and e10.state()["finding"].get("every") == 0))
     C.append(("the board names the match closest to the line, with every bookmaker's price", (lambda c: c is None or (c["field"] and c["needed"] > 1 and c["book"]))(e10.state()["closest"])))
+    lv_ = e10.state()["live"][0]
+    posts_ = []
+    def card_spy(payload, mid):
+        posts_.append(("edit" if mid else "post", payload)); return mid or "m1"
+    e14 = Engine(interval=60, now_fn=lambda: clock[0], scrape_fn=lambda u: (page, None), news_fn=lambda rec: ("", ""), persist=False, alert_fn=lambda t, m, c: None, card_fn=card_spy,
+                 confirm_fn=lambda book, home, away, price, outcome: ("seen", "https://slowbook.example/event/123", "page", price))
+    e14.add_watch("https://odds.example/m14"); e14.cycle(); clock[0] += 61; e14.cycle()
+    first_, last_ = posts_[0][1]["embeds"][0], posts_[-1][1]["embeds"][0]
+    C.append(("Discord gets one card per flagged price, edited in place, and its title links to the bookmaker",
+              [x[0] for x in posts_] == ["post", "edit", "edit"] and first_["title"].endswith("at SlowBook: 2.75") and last_["url"] == "https://slowbook.example/event/123"
+              and "Same price on SlowBook's own site" in last_["description"] and "Added to the record" in last_["description"] and last_["color"] == 0x3DF2A4
+              and posts_[-1][1]["content"].startswith("Confirmed")))
+    posts_.clear(); cur_ = [page]
+    e15 = Engine(interval=60, now_fn=lambda: clock[0], scrape_fn=lambda u: (cur_[0], None), news_fn=lambda rec: ("", ""), persist=False, alert_fn=lambda t, m, c: None, card_fn=card_spy)
+    e15.add_watch("https://odds.example/m15"); e15.cycle(); cur_[0] = page.replace("| SlowBook | 2.75 |", "| SlowBook | 2.40 |"); clock[0] += 61; e15.cycle()
+    C.append(("when the price goes, the same card is edited to say so", posts_[-1][0] == "edit" and "cut the price to 2.40" in posts_[-1][1]["embeds"][0]["description"]
+              and posts_[-1][1]["content"].startswith("No longer out of line")))
+    posts_.clear()
+    e16 = Engine(interval=60, now_fn=lambda: clock[0], scrape_fn=lambda u: (page, None), news_fn=lambda rec: ("", ""), persist=False, alert_fn=lambda t, m, c: None, card_fn=card_spy)
+    e16.add_watch("https://odds.example/m16"); e16.cycle(); e16.cards.clear(); posts_.clear(); clock[0] += 61; e16.cycle()     # as after a restart that lost the card
+    answers_ = [("unreadable", "", "", None)]
+    e17 = Engine(interval=60, now_fn=lambda: clock[0], scrape_fn=lambda u: (page, None), news_fn=lambda rec: ("", ""), persist=False, alert_fn=lambda t, m, c: None,
+                 card_fn=lambda payload, mid: mid or "m9", confirm_fn=lambda book, home, away, price, outcome, page="": answers_[0])
+    e17.add_watch("https://odds.example/m17"); e17.cycle(); clock[0] += 61; e17.cycle()
+    was_ = e17.record[0]["verify"]
+    answers_[0] = ("seen", "https://slowbook.example/league", "page", 2.75); clock[0] += 1900; e17.cycle()
+    lv17 = e17.state()["live"][0]
+    C.append(("a price that could not be checked at first is checked again later, and the record gains the answer with its time",
+              was_ == "unreadable" and e17.record[0]["verify"] == "seen" and e17.record[0]["link"] == "https://slowbook.example/league" and e17.record[0].get("verify_t")
+              and lv17["verify"] == "seen" and lv17["book_link"] == "https://slowbook.example/league" and lv17.get("book_t")))
+    answers_[0] = ("unreadable", "", "", None); clock[0] += 1000; e17.cycle()
+    C.append(("a later failed read does not hide an earlier answer", e17.record[0]["verify"] == "seen" and e17.state()["live"][0]["verify"] == "seen"))
+    e18 = Engine(interval=60, now_fn=lambda: clock[0], scrape_fn=lambda u: (page, None), news_fn=lambda rec: ("", ""), persist=False, alert_fn=lambda t, m, c: None, card_fn=lambda payload, mid: mid or "m")
+    e18.add_watch("https://odds.example/m18", kickoff_ts=clock[0] + 5 * 86400); e18.cycle(); clock[0] += 61; e18.cycle()
+    far_ = (len(e18.live), len(e18.record), len(e18.seen))
+    e18.window_h = 0; e18.read_at = {}; clock[0] += 61; e18.cycle(); clock[0] += 61; e18.read_at = {}; e18.cycle()
+    lifted_ = (len(e18.live), len(e18.record))
+    e18.window_h = 48; e18.read_at = {}; clock[0] += 61; e18.cycle()
+    C.append(("a match more than 48 hours from kick-off is watched but not flagged or recorded, and lifting the window flags it",
+              far_ == (0, 0, 0) and lifted_[0] >= 1 and lifted_[1] == 1 and len(e18.live) == 0 and e18.state()["window_h"] == 48 and e18.state()["matches"][0]["early"] is True))
+    C.append(("a price confirmed after its card was lost still gets a card, in its confirmed state", len(posts_) >= 1 and posts_[-1][1]["content"].startswith("Confirmed")
+              and "Added to the record" in posts_[-1][1]["embeds"][0]["description"]))
+    sent_c = []
+    mid_c = discord_card("https://discord.com/api/webhooks/1/abc", {"content": "x"}, send=lambda url, body, method: (sent_c.append((method, url)), {"id": "99"})[1])
+    discord_card("https://discord.com/api/webhooks/1/abc", {"content": "y"}, mid_c, send=lambda url, body, method: (sent_c.append((method, url)), {})[1])
+    blk = '<script type="application/json">{"x":1,"odds":{"111":{"B3":{"betId":111,"bookmakerCode":"B3","oddsDecimal":2.75,"selectionId":"PA1","status":"ACTIVE","betFeedTimestamp":"2026-11-14T17:26:34.017355647Z"},' \
+          '"WH":{"betId":111,"bookmakerCode":"WH","oddsDecimal":2.5,"selectionId":"OB_OU1","status":"ACTIVE","betFeedTimestamp":"2026-11-14T19:44:44.5Z"},"UN":{"oddsDecimal":2.63,"selectionId":"k1"},"FR":{"oddsDecimal":2.5},"LD":{"oddsDecimal":2.6}},' \
+          '"222":{"B3":{"oddsDecimal":3.4,"selectionId":"PA2"},"WH":{"oddsDecimal":3.3},"UN":{"oddsDecimal":3.4},"FR":{"oddsDecimal":3.5},"LD":{"oddsDecimal":3.4}},' \
+          '"999":{"B3":{"oddsDecimal":11.0},"WH":{"oddsDecimal":12.0}}}}</script>'
+    gridf = {"bet365": (2.75, 3.4, 2.5), "William Hill": (2.5, 3.3, 2.7), "Unibet": (2.63, 3.4, 2.75), "Betfred": (2.5, 3.5, 2.8), "Ladbrokes": (2.6, 3.4, 2.75)}
+    pf_ = page_feed(blk, gridf)
+    C.append(("the page's own data gives the age of each price and the bookmaker's id for the selection",
+              pf_["bet365"]["home"]["sel"] == "PA1" and pf_["bet365"]["draw"]["sel"] == "PA2" and pf_["William Hill"]["home"]["sel"] == "OB_OU1"
+              and time.gmtime(pf_["bet365"]["home"]["t"])[:5] == (2026, 11, 14, 17, 26) and "away" not in pf_["bet365"] and page_feed("<html>nothing</html>", gridf) == {}))
+    t0_ = 1_800_000_000.0
+    cp_ = card_payload({"home": "Barnsley", "away": "Sheffield Wednesday", "book": "bet365", "outcome": "home", "price": 3.0, "average": 2.69, "kickoff": t0_ + 5 * 86400,
+                        "odds_url": "https://odds.example/m", "site": "https://bet365.com", "t_seen": t0_, "stage": "seen", "feed_t": t0_ - 7500, "source": ["unreadable", "", None]})
+    de_ = cp_["embeds"][0]["description"]
+    C.append(("when the bookmaker's page is not found the card links to the bookmaker's site, and gives the price's age and an early-match note",
+              cp_["embeds"][0]["url"] == "https://bet365.com" and "[Open bet365](https://bet365.com)" in de_ and "last changed on the odds site 2 h 05 min before" in de_
+              and "more than 3 days away" in de_ and "could not be reached" in de_))
+    cp2_ = card_payload({"home": "Barnsley", "away": "Sheffield Wednesday", "book": "bet365", "outcome": "home", "price": 3.0, "average": 2.69, "average_now": 2.74, "kickoff": t0_ + 3600,
+                         "odds_url": "https://odds.example/m", "site": "https://bet365.com", "t_seen": t0_, "stage": "confirmed"})
+    C.append(("a bookmaker's league page is found from the odds page's address", league_key("https://www.oddschecker.com/football/english/league-1/barnsley-v-sheffield-wednesday/winner") == "english/league-1"
+              and league_key("https://www.oddschecker.com/football/uefa-nations-league/romania-v-poland/winner") == ""
+              and book_page_for("bet365", "https://www.oddschecker.com/football/english/league-1/a-v-b/winner").startswith("https://www.bet365.com/#/AC/")
+              and book_page_for("Coral", "https://www.oddschecker.com/football/english/league-1/a-v-b/winner") == ""))
+    cp3_ = card_payload({"home": "Barnsley", "away": "Sheffield Wednesday", "book": "bet365", "outcome": "home", "price": 3.0, "average": 2.69, "kickoff": t0_ + 3600,
+                         "odds_url": "https://odds.example/m", "site": "https://bet365.com", "league_page": "https://www.bet365.com/#/AC/B1/C1/D1002/E1/G40/", "t_seen": t0_, "stage": "seen"})
+    C.append(("with a league page known, the card's title links to it from the first moment", cp3_["embeds"][0]["url"] == "https://www.bet365.com/#/AC/B1/C1/D1002/E1/G40/"
+              and "page for this league, where the match is listed" in cp3_["embeds"][0]["description"]))
+    def lp_http(url, body, timeout=75):
+        if url == CTX_SEARCH: return {"results": []}
+        if url == scan.CTX_ANSWERS: return {"json_content": {"url": ""}}
+        assert body["url"] == "https://www.bet365.com/#/AC/B1/C1/D1002/E1/G40/"
+        return {"markdown": {"success": True, "data": "England League 1. Barnsley Sheff Wed 3.00 3.70 2.01. Blackpool Wigan 2.15 3.40 2.85"},
+                "json": {"success": True, "data": {"is_this_match": True, "home_win": 3.0, "draw": 3.7, "away_win": 2.01}}}
+    lp_ = ctx_confirm_at_source("k", "bet365", "Barnsley", "Sheffield Wednesday", 3.0, "home", http=lp_http, known="https://www.bet365.com/#/AC/B1/C1/D1002/E1/G40/")
+    lp2_ = ctx_confirm_at_source("k", "bet365", "Barnsley", "Sheffield Wednesday", 3.0, "home", known="https://www.bet365.com/#/AC/B1/C1/D1002/E1/G40/",
+                                 http=lambda url, body, timeout=75: {"results": []} if url == CTX_SEARCH else ({"json_content": {}} if url == scan.CTX_ANSWERS else {"markdown": {"success": False}}))
+    C.append(("a known league page is read first for the price, and stays the link even when it will not read",
+              lp_[0] == "seen" and lp_[1].endswith("/G40/") and lp_[3] == 3.0 and lp2_[0] == "blocked" and lp2_[1].endswith("/G40/")))
+    lp3_ = ctx_confirm_at_source("k", "bet365", "Luton", "Peterborough United", 1.65, "home", known="https://www.bet365.com/#/AC/B1/C1/D1002/E1/G40/",
+                                 http=lambda url, body, timeout=75: {"results": []} if url == CTX_SEARCH else ({"json_content": {}} if url == scan.CTX_ANSWERS else
+                                       {"markdown": {"success": True, "data": "England League 1. Barnsley Sheff Wed 3.00 3.70 2.01"}, "json": {"success": True, "data": {"is_this_match": False}}}))
+    C.append(("a failed check says why: the page would not open, the match was not on it, or no page was found", lp3_[0] == "not listed"))
+    bd_ = {"title": "bet365", "colors": [{"hex": "#027B5B", "name": "green"}], "logos": [
+        {"url": "https://media.example/wide.svg", "type": "logo", "mode": "light", "resolution": {"width": 600, "height": 120}},
+        {"url": "https://media.example/icon.png", "type": "icon", "mode": "has_opaque_background", "resolution": {"width": 256, "height": 256}},
+        {"url": "", "type": "icon"}]}
+    pl_ = pick_logo(bd_)
+    C.append(("the bookmaker's mark is chosen from Context.dev's brand data: a square icon with its own background first",
+              pl_["icon"] == "https://media.example/icon.png" and pl_["png"] == "https://media.example/icon.png" and pl_["bg"] == "" and pl_["color"] == "#027B5B"
+              and pick_logo({"logos": []}) == {} and pick_logo({"logos": [{"url": "https://media.example/a.svg", "mode": "dark"}]}) == {"icon": "https://media.example/a.svg", "png": "", "bg": "#10142b", "color": ""}))
+    seen_ = []
+    def brand_get(url, body=None):
+        seen_.append((url, body))
+        if body is None: raise urllib.error.HTTPError(url, 405, "no", {}, io.BytesIO(b"method not allowed"))
+        return {"status": "ok", "brand": bd_}
+    b1_, w1_ = ctx_brand("k", "bet365.com", get=brand_get)
+    C.append(("brand data is asked for by domain, and a second form of the request is tried if the first is refused",
+              b1_ == bd_ and "/brand/retrieve?domain=bet365.com" in seen_[0][0] and seen_[1][1] == {"type": "by_domain", "domain": "bet365.com"}))
+    C.append(("the card says when the other bookmakers are moving towards the flagged price", "the rest have moved from 2.69 to 2.74, towards bet365's price" in cp2_["embeds"][0]["description"]))
+    C.append(("a card is posted with wait=true and edited by its message id", mid_c == "99" and sent_c == [("POST", "https://discord.com/api/webhooks/1/abc?wait=true"),
+                                                                                                       ("PATCH", "https://discord.com/api/webhooks/1/abc/messages/99")]))
+    def list_http(url, body, timeout=75):
+        if url == CTX_SEARCH: return {"results": [{"url": "https://www.coral.co.uk/en/sports/coupons/football/today-s-matches/334", "title": "Today's matches"}]}
+        return {"markdown": {"success": True, "data": "Romania v Poland 4/1 3/1 7/10"}, "json": {"success": True, "data": {"is_this_match": True, "home_win": 5.0, "draw": 4.0, "away_win": 1.70}},
+                "parsed": {"success": True, "data": {"links": ["/en/sports/promotions", "/en/sports/event/football/romania-v-poland/12345", "https://other.example/romania-v-poland"]}}}
+    cl_ = ctx_confirm_at_source("k", "Coral", "Romania", "Poland", 1.70, "away", http=list_http)
+    C.append(("from a bookmaker's list of matches, the link goes to this match's own page", cl_[0] == "seen" and cl_[1] == "https://www.coral.co.uk/en/sports/event/football/romania-v-poland/12345"))
+    C.append(("a live row says it is in the record once it has been added", lv_["in_record"] is True and lv_["backed"] is None))
+    pg1 = page; pg2 = page.replace("| SlowBook | 2.75 |", "| SlowBook | 2.40 |")
+    cur_ = [pg1]; al12 = []
+    e12 = Engine(interval=60, now_fn=lambda: clock[0], scrape_fn=lambda u: (cur_[0], None), news_fn=lambda rec: ("", ""), persist=False,
+                 alert_fn=lambda t, m, c: al12.append((t, m)))
+    e12.add_watch("https://odds.example/m12"); e12.cycle(); cur_[0] = pg2; clock[0] += 61; e12.cycle()
+    s12 = e12.state()["seen"][0]
+    C.append(("a price cut within the minute is not recorded, and the log and an alert say the bookmaker cut it",
+              not e12.record and s12.get("end", {}).get("why") == "cut" and abs(s12["end"]["price_now"] - 2.40) < 0.001
+              and any(t.startswith("No longer out of line") and "cut the price to 2.40" in m for t, m in al12)))
+    pg3 = "\n".join(("| %s | 2.72 | 3.30 | 2.90 |" % l.split("|")[1].strip()) if (l.startswith("|") and "SlowBook" not in l and "2." in l) else l for l in page.split("\n"))
+    cur_[0] = pg1; e13 = Engine(interval=60, now_fn=lambda: clock[0], scrape_fn=lambda u: (cur_[0], None), news_fn=lambda rec: ("", ""), persist=False, alert_fn=lambda t, m, c: None)
+    e13.add_watch("https://odds.example/m13"); e13.cycle(); cur_[0] = pg3; clock[0] += 61; e13.cycle()
+    s13 = e13.state()["seen"][0]
+    C.append(("when the others move to a bookmaker's price it is not recorded, and the log says they caught up",
+              not e13.record and s13.get("end", {}).get("why") == "caught" and abs(s13["end"]["price_now"] - 2.75) < 0.001))
     C.append(("a live row carries every bookmaker's price for that result", len(fld_) >= 5 and fld_ == sorted(fld_, key=lambda x: x[1]) and any(b_ == "SlowBook" for b_, _ in fld_)))
     C.append(("a live row carries the bookmaker's own page once it is found", e10.state()["live"][0]["book_link"] == "https://slowbook.example/event/123"))
     C.append(("the first alert is followed by one linking to the bookmaker's own page, and the check is not repeated",
@@ -2604,10 +3497,10 @@ def _selftest():
     C.append(("on a page listing many matches, only the price read for this match counts as the same price",
               c1[0] == "seen" and c1[3] == 1.70 and c2[0] == "not shown" and c2[1].endswith("/334")))
     C.append(("a news article naming both teams is not taken for the bookmaker's match page",
-              ctx_confirm_at_source("k", "bet365", "Norwich", "Cardiff City", 1.73, "home", http=art_http)[0] == "unreadable"))
+              ctx_confirm_at_source("k", "bet365", "Norwich", "Cardiff City", 1.73, "home", http=art_http)[0] in ("not listed", "no page", "blocked")))
     C.append(("an unknown bookmaker, or no page for the match, is reported as such",
               ctx_confirm_at_source("k", "Nobody Bets", "A", "B", 2.0)[0] == "no site"
-              and ctx_confirm_at_source("k", "Star Sports", "Romania", "Poland", 1.73, "away", http=lambda u, b, timeout=75: {"results": []} if u == CTX_SEARCH else {"json_content": {}})[0] == "unreadable"))
+              and ctx_confirm_at_source("k", "Star Sports", "Romania", "Poland", 1.73, "away", http=lambda u, b, timeout=75: {"results": []} if u == CTX_SEARCH else {"json_content": {}})[0] == "no page"))
     C.append(("a recorded price carries the result of the check on the bookmaker's own site", e9.record[0]["verify"] == "not shown" and e9.record[0]["link"] == "https://slowbook.example/m"))
     C.append(("two bookmakers out of line on the same result count as one bet, at the better price",
               len(e6.live) == 2 and len(e6.record) == 1 and e6.record[0]["price"] == 2.80))
@@ -2818,8 +3711,10 @@ def _selftest():
     ev = build_evidence(ms); s4 = ev["settings"]["4"]
     C.append(("chart data: running totals end at the right profit", abs(s4["series"][-1][1] - s4["roi"] * s4["bets"]) < 0.05 and s4["series"][-1][3] == s4["bets"]))
     blk_ = readme_block(ev)
-    C.append(("the README section shows the return per bet, in total, per year and on a bank", "Return on every bet" in blk_ and "not a yearly figure" in blk_
-              and "average return a year" in blk_ and "Total profit at £100 a bet" in blk_ and "Season by season" in blk_ and "filled in by" not in blk_))
+    main_ = blk_.split("<details>")[0]
+    C.append(("the README leads with one short table and folds the rest away", "Return on every bet" in main_ and "not a yearly figure" in main_ and "Average a year on the bank" in main_
+              and main_.count("\n| ") <= 5 and "Total profit at £100 a bet" in blk_.split("<details>")[1] and "Season by season" in blk_ and blk_.rstrip().endswith("</details>")
+              and "filled in by" not in blk_))
     C.append(("the season table and the pot figures add up", sum(x["bets"] for x in s4["seasons"]) == s4["bets"] and abs(sum(x["units"] for x in s4["seasons"]) - s4["units"]) < 0.3
               and s4["pot"][0]["stake"] == 20 and s4["pot"][1]["total"] == round(s4["roi"] * s4["bets"] * 50) and s4["n_seasons"] == 2))
     C.append(("chart data: the outlier line beats the average-price line", s4["series"][-1][1] > s4["series"][-1][2] and s4["older_bets"] + s4["newer_bets"] == s4["bets"] and ev["split_month"]))
@@ -2839,9 +3734,19 @@ def main():
     p = sub.add_parser("alert-test"); p.add_argument("--ntfy", default="", help="ntfy.sh topic to send the test to")
     p.add_argument("--sample", action="store_true", help="send what a real pair of alerts looks like")
     p = sub.add_parser("betlinks", help="show what an odds page holds that could link straight to a bookmaker's bet"); p.add_argument("url")
+    p = sub.add_parser("logos", help="fetch every bookmaker's logo through Context.dev's brand data")
+    p.add_argument("--refresh", action="store_true", help="fetch them all again, not only the missing ones")
+    p = sub.add_parser("drop-early", help="take out of the record every entry that was recorded more than a set time before kick-off")
+    p.add_argument("--hours", type=float, default=48)
+    sub.add_parser("usage", help="print how many Context.dev calls of each kind the app has made, for the demo and the write-up")
+    p = sub.add_parser("selids", help="print each bookmaker's own id for the three results of a match, from the odds page's data"); p.add_argument("url")
+    p = sub.add_parser("bookpage", help="tell Offside a bookmaker's own page for a league, so links and price checks go there")
+    p.add_argument("book", nargs="?"); p.add_argument("league", nargs="?", help="the league as it appears in the odds site's addresses, such as english/league-2")
+    p.add_argument("url", nargs="?")
     p = sub.add_parser("source", help="look for a bookmaker's own page for a match and read its price")
     p.add_argument("book"); p.add_argument("home"); p.add_argument("away"); p.add_argument("price", type=float)
     p.add_argument("outcome", choices=("home", "draw", "away"))
+    p.add_argument("--league", default="any", help="the league, such as english/league-1, to use the bookmaker's known page for it")
     p = sub.add_parser("discover"); p.add_argument("leagues", nargs="*", help='league names in plain words, in quotes')
     p.add_argument("--soon", action="store_true", help="any professional match worldwide in the next day")
     p.add_argument("--tested", action="store_true", help="these are among the 18 tested leagues")
@@ -2867,7 +3772,10 @@ def main():
     p.add_argument("--rediscover-hours", type=float, default=3.0, help="how often to look for new matches (0 = never)")
     p.add_argument("--in-play", action="store_true", help="keep reading prices after kick-off (not covered by the test)")
     p.add_argument("--ntfy", default="", help="send phone alerts to this ntfy.sh topic")
+    p.add_argument("--invite", default="", help="the Discord invite link shown on the dashboard's Join button")
+    p.add_argument("--public", action="store_true", help="for sharing the address: nothing can be added from the page, and its buttons are paced")
     p.add_argument("--alert-min", type=int, default=3, choices=(3, 4, 5), help="only alert on prices that pass at least this setting (3 = every flag)")
+    p.add_argument("--window-hours", type=float, default=48, help="only flag and record matches kicking off within this many hours (0 = no limit)")
     p.add_argument("--parallel", type=int, default=6, help="how many pages to read side by side (Context.dev allows up to 50 at once)")
     p.add_argument("--pot", type=float, default=1000.0, help="starting size of the paper account")
     p.add_argument("--stake-pct", type=float, default=2.0, help="paper stake per bet, as a percentage of the pot")
@@ -2881,20 +3789,41 @@ def main():
             sys.exit("Nothing to send to. Set the text-message settings (TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM, OFFSIDE_SMS_TO) "
                      "or run:  python app.py alert-test --ntfy offside-owen-7391")
         if a.sample:
-            hook_ = (os.environ.get("OFFSIDE_WEBHOOK") or "").strip()
-            if hook_: print("posting to the chat webhook ending ...%s" % hook_[-6:])
-            n = notify("Out of line: Romania v Poland", "Poland to win at Star Sports: 1.73, everyone else averages 1.64 (+5%). Kick-off Sat 21:45. On the page, tap Star Sports's "
-                       "price in the Poland row to add it to the bet slip. Checking again in a minute.", "https://www.oddschecker.com/football/uefa-nations-league/romania-v-poland/winner")
-            n += notify("Star Sports's own page for Romania v Poland", "Poland to win. The same price, 1.73, is showing on Star Sports's own site. This link goes straight to the match there.",
-                        "https://www.starsports.bet/")
-            print("sent %d sample alert(s). These are examples of the wording, not live prices." % n); return
+            hook_ = (os.environ.get("OFFSIDE_WEBHOOK") or "").strip().strip('"')
+            if "discord" not in hook_:
+                sys.exit("The sample card needs a Discord webhook:  set OFFSIDE_WEBHOOK=<the webhook address>")
+            print("posting a sample card to the Discord webhook ending ...%s" % hook_[-6:])
+            d_ = {"home": "Home Team", "away": "Away Team", "book": "Star Sports", "outcome": "away", "price": 1.73, "average": 1.64, "kickoff": time.time() + 3600,
+                  "odds_url": "https://www.oddschecker.com/football", "site": book_site("Star Sports"), "t_seen": time.time(), "stage": "seen", "sample": True}
+            try:
+                mid_ = discord_card(hook_, card_payload(d_))
+                print("  posted (first sighting). It will now be edited twice, as a real alert would be.")
+                time.sleep(4); d_["source"] = ["seen", book_site("Star Sports"), 1.73]; discord_card(hook_, card_payload(d_), mid_)
+                time.sleep(4); d_.update(stage="confirmed", record="added"); discord_card(hook_, card_payload(d_), mid_)
+                print("  done: one message, updated in place. It is marked as a sample and will remove itself in 25 seconds.")
+                rh_ = results_hook(); rid_ = None
+                if rh_:
+                    rid_ = discord_card(rh_, result_payload({"home": "Home Team", "away": "Away Team", "outcome": "away", "book": "Star Sports", "price": 1.73, "result": "won", "score": "0-2",
+                                                             "stake": 20.0, "profit": 0.73, "close_avg": 1.62}, {"finished": 5, "won": 2, "bank": 994.6, "start": 1000.0}, sample=True))
+                    print("  a sample result card was posted to the %s channel." % ("results" if os.environ.get("OFFSIDE_RESULTS_WEBHOOK") else "alerts"))
+                time.sleep(25); discord_delete(hook_, mid_)
+                if rid_: discord_delete(rh_, rid_)
+                print("  samples removed.")
+            except urllib.error.HTTPError as e:
+                print("  Discord refused it: HTTP %d %s" % (e.code, e.read().decode("utf-8", "replace")[:200]))
+            except Exception as e:
+                print("  could not reach Discord: %s" % str(e)[:200])
+            return
         n = notify("Offside test alert", "If you can read this on your phone, alerts are working. Tap to open the odds site.", "https://www.oddschecker.com/football")
         print("sent %d alert(s)%s" % (n, "" if n else ". Nothing was sent: check the connection and the topic name.")); return
     if a.cmd == "betlinks":
         key_ = os.environ.get("CONTEXT_DEV_API_KEY")
         if not key_: sys.exit("Set CONTEXT_DEV_API_KEY first.")
-        res = scan.http(scan.CTX_SCRAPE, {"url": a.url, "formats": {"html": True}, "sharedParams": {"waitFor": 3500, "country": "GB", "dismissPopups": True},
-                                          "maxAgeMs": 0, "timeoutOpts": {"milliseconds": 45000, "behavior": "return-partial"}}, key_, timeout=120)
+        try:
+            res = scan.http(scan.CTX_SCRAPE, {"url": a.url, "formats": {"html": True}, "sharedParams": {"waitFor": 3500, "country": "GB", "dismissPopups": True},
+                                              "maxAgeMs": 0, "timeoutOpts": {"milliseconds": 45000, "behavior": "return-partial"}}, key_, timeout=120)
+        except Exception as e:
+            sys.exit("The page could not be fetched through Context.dev: %s" % str(e)[:200])
         page_html = (res.get("html") or {}).get("data") or ""
         os.makedirs(DATA, exist_ok=True)
         open(os.path.join(DATA, "debug_betlinks.html"), "w", encoding="utf-8").write(page_html)
@@ -2919,15 +3848,159 @@ def main():
         for name, pat in (("__NEXT_DATA__", r'id="__NEXT_DATA__"'), ("__INITIAL_STATE__", r"__INITIAL_STATE__"), ("__PRELOADED_STATE__", r"__PRELOADED_STATE__"),
                           ("application/json script", r'type="application/json"'), ("application/ld+json", r'type="application/ld\+json"')):
             print("   %-26s %s" % (name, "present" if re.search(pat, txt) else "not present"))
+        print("\n5. One bookmaker's entry in the page's own data, with what is around it:")
+        m_ = re.search(r'.{0,500}"bookmakerCode"\s*:\s*"[A-Za-z0-9]+".{0,700}', txt, re.S)
+        print("   " + (re.sub(r"\s+", " ", m_.group(0))[:1200] if m_ else "none found"))
+        print("\n6. The site's scripts that handle the bet slip and clicks out to bookmakers:")
+        srcs = []
+        for s_ in re.findall(r'(?:https?:)?//[^"\'\s<>]+?\.js', txt):
+            if re.search(r"betslip|clickout|bookie", s_, re.I) and s_ not in srcs: srcs.append(s_)
+        if not srcs: print("   none found on the page")
+        for s_ in srcs[:3]:
+            full = ("https:" + s_) if s_.startswith("//") else s_
+            try:
+                req = urllib.request.Request(full, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"})
+                code = urllib.request.urlopen(req, timeout=40).read().decode("utf-8", "replace")
+            except Exception as e:
+                print("   %s: could not be downloaded (%s)" % (full.split("/")[-1][:70], str(e)[:90])); continue
+            open(os.path.join(DATA, "debug_" + re.sub(r"[^A-Za-z0-9.]+", "_", full.split("/")[-1])[:80]), "w", encoding="utf-8").write(code)
+            print("   %s: %d characters" % (full.split("/")[-1][:70], len(code)))
+            snips = []
+            for pat in (r"clickout", r"deep.?link", r"bookie.?redirect|bet.?redirect|redirect\w*url", r"/bet-?slip/|betslip\?", r"selectionId", r"bookmakerCode"):
+                for mm in re.finditer(pat, code, re.I):
+                    snip = re.sub(r"\s+", " ", code[max(0, mm.start() - 120):mm.end() + 180])
+                    if re.search(r"https?:|/api|\.htm|\?[a-zA-Z]+=|`", snip) and not any(snip[40:100] in x for x in snips):
+                        snips.append(snip)
+                    if len(snips) >= 12: break
+                if len(snips) >= 12: break
+            for snip in snips: print("     ..." + snip + "...")
+            if not snips: print("     nothing that looks like an outbound link was found in it")
+        return
+    if a.cmd == "logos":
+        key_ = os.environ.get("CONTEXT_DEV_API_KEY")
+        if not key_: sys.exit("Set CONTEXT_DEV_API_KEY first.")
+        print("Fetching bookmaker logos through Context.dev's brand data ...")
+        n_ = fetch_brands(key_, only_missing=not a.refresh)
+        print("\n%d of %d bookmaker sites have a logo. The running dashboard shows them within half a minute." % (n_, len(set(BOOK_SITES.values()))))
+        return
+    if a.cmd == "drop-early":
+        rec_ = load("record.json", []) or []
+        out_ = [r for r in rec_ if r.get("kickoff") and r["kickoff"] - r["t"] > a.hours * 3600 and r.get("result") is None]
+        if not out_:
+            print("Nothing to remove: no unfinished entry was recorded more than %g hours before kick-off." % a.hours); return
+        save("record_removed.json", (load("record_removed.json", []) or []) + out_)
+        save("record.json", [r for r in rec_ if r not in out_])
+        for r in out_:
+            print("  removed: %s v %s, %s %s at %.2f, recorded %.1f days before kick-off" % (r["home"], r["away"], r["book"], r["outcome"], r["price"], (r["kickoff"] - r["t"]) / 86400.0))
+        print("\n%d removed, %d left in the record. The removed entries are kept in offside_data\\record_removed.json." % (len(out_), len(rec_) - len(out_)))
+        return
+    if a.cmd == "usage":
+        st_ = (load("state.json", {}) or {}).get("stats") or {}
+        c_ = st_.get("ctx") or {}
+        if not c_: sys.exit("No counts yet: start the app with  python app.py serve  and let it run for a minute.")
+        print("Context.dev calls made by Offside%s:\n" % ((" since " + time.strftime("%a %d %b %H:%M", time.localtime(st_["since"]))) if st_.get("since") else ""))
+        for k_, what in (("prices", "odds pages read: scrape with parse rules, every bookmaker's price as structured data"),
+                         ("extract", "bookmaker pages checked: scrape with JSON extraction, the price on the bookmaker's own site"),
+                         ("search", "searches: limited to one bookmaker's site, to find its page for a match"),
+                         ("screenshot", "screenshots: scrape with a screenshot, kept as proof with each recorded price"),
+                         ("answers", "researched answers: team news behind a flagged price, and final scores"),
+                         ("links", "league pages read: scrape with a link rule, to find the coming matches"),
+                         ("brand", "brand lookups: each bookmaker's logo and colours, for the cards and the Discord alerts")):
+            print("  %7s  %s" % (format(int(c_.get(k_) or 0), ","), what))
+        if c_.get("since") and st_.get("since") and c_["since"] - st_["since"] > 3600:
+            print("\nBookmaker checks, searches and league pages have been counted since %s. The other three since the start." % time.strftime("%a %H:%M", time.localtime(c_["since"])))
+        return
+    if a.cmd == "bookpage" and not (a.book and a.league and a.url):
+        counts = {}
+        for w in load("watch.json", []):
+            k_ = league_key(w.get("url") or "")
+            if k_ and not (w.get("kickoff") and w["kickoff"] < time.time()): counts[k_] = counts.get(k_, 0) + 1
+        pages_ = book_pages()
+        print("Leagues being watched, and the bookmaker pages known for each:\n")
+        for k_ in sorted(counts, key=lambda x: -counts[x]):
+            have = sorted(b for b, v in pages_.items() if k_ in v)
+            print("  %-28s %3d matches   %s" % (k_, counts[k_], ("pages known for: " + ", ".join(have)) if have else "no bookmaker pages yet"))
+        if not counts: print("  none yet: run  python app.py hub --deep  first")
+        if not a.book:
+            print("\nTo add the missing ones for a bookmaker, one paste each:  python app.py bookpage \"bet365\"")
+            return
+        name = re.sub(r"[^a-z0-9]", "", a.book.lower())
+        if name not in BOOK_SITES: sys.exit("That bookmaker is not in the list. Use the name as the dashboard shows it, such as bet365 or \"Paddy Power\".")
+        missing = [k_ for k_ in sorted(counts, key=lambda x: -counts[x]) if k_ not in (pages_.get(name) or {})]
+        if not missing:
+            print("\n%s already has a page for every league being watched." % a.book); return
+        print("\nFor each league below: open that league on %s's site, copy the address from the address bar, paste it here and press Enter." % a.book)
+        print("Press Enter on its own to skip a league. Ctrl+C stops.\n")
+        saved, used, n_added = (load("book_pages.json", {}) or {}), set((pages_.get(name) or {}).values()), 0
+        for k_ in missing:
+            try:
+                u_ = input("  %-26s (%d matches)  address: " % (k_, counts[k_])).strip().strip('"').strip("'")
+            except (EOFError, KeyboardInterrupt):
+                print(); break
+            if not u_: continue
+            if not re.match(r"^https?://", u_):
+                print("      that does not look like an address, skipped"); continue
+            if BOOK_SITES[name].split(".")[0] not in u_.lower():
+                print("      that address is not on %s's site, skipped" % a.book); continue
+            if u_ in used:
+                print("      that is the same address as another league, skipped: each league has its own"); continue
+            saved.setdefault(name, {})[k_] = u_; used.add(u_); n_added += 1
+            save("book_pages.json", saved)
+            print("      saved")
+        print("\n%d added. The running app picks them up within half a minute. No restart is needed." % n_added)
+        return
+    if a.cmd == "bookpage":
+        lg = a.league.strip().strip("/").lower()
+        if not re.match(r"^[a-z0-9-]+/[a-z0-9-]+$", lg): sys.exit("The league should look like english/league-2, as in the odds site's addresses.")
+        if not re.match(r"^https?://", a.url): sys.exit("The address should start with https://")
+        name = re.sub(r"[^a-z0-9]", "", a.book.lower())
+        if name not in BOOK_SITES: sys.exit("That bookmaker is not in the list. Use the name as the dashboard shows it, such as bet365 or \"Paddy Power\".")
+        saved = load("book_pages.json", {}) or {}
+        saved.setdefault(name, {})[lg] = a.url
+        save("book_pages.json", saved)
+        print("Saved. %s flags in %s will link to %s, and that page will be read to check the price." % (a.book, lg, a.url))
+        print("The running app picks this up within half a minute. No restart is needed.")
+        return
+    if a.cmd == "selids":
+        key_ = os.environ.get("CONTEXT_DEV_API_KEY")
+        if not key_: sys.exit("Set CONTEXT_DEV_API_KEY first.")
+        try:
+            res = scan.http(scan.CTX_SCRAPE, {"url": a.url, "formats": {"html": True}, "sharedParams": {"waitFor": 3500, "country": "GB", "dismissPopups": True},
+                                              "maxAgeMs": 0, "timeoutOpts": {"milliseconds": 45000, "behavior": "return-partial"}}, key_, timeout=120)
+        except Exception as e:
+            sys.exit("The page could not be fetched through Context.dev: %s" % str(e)[:200])
+        page_html = (res.get("html") or {}).get("data") or ""
+        home_, away_ = teams_in_address(a.url)
+        grid_ = coherent(html_buttons(page_html, home_, away_))
+        feed_ = page_feed(page_html, grid_)
+        print("%d bookmakers read from the page, ids found for %d of them.\n" % (len(grid_), len(feed_)))
+        if not feed_: sys.exit("The page's data block was not where it was expected. Tell me, and paste the output of the betlinks command for this page.")
+        for name in sorted(feed_, key=lambda n: n.lower()):
+            print(name)
+            for lab in ("home", "draw", "away"):
+                x = feed_[name].get(lab)
+                if x: print("   %-5s price %-6.2f id %s%s" % (lab, grid_[name][("home", "draw", "away").index(lab)], x["sel"][:110] or "(none)",
+                                                                ("   last changed " + time.strftime("%H:%M", time.localtime(x["t"]))) if x.get("t") else ""))
+        b3 = feed_.get("bet365") or {}
+        if b3:
+            print("\nA link to try for bet365. Its format is my guess and is untested. Open it and say what happens:")
+            for lab in ("home", "draw", "away"):
+                if b3.get(lab) and b3[lab]["sel"]:
+                    print("   %-5s https://www.bet365.com/dl/sportsbookredirect?bs=%s&bet=1" % (lab, urllib.parse.quote(b3[lab]["sel"], safe="~-")))
         return
     if a.cmd == "source":
         key_ = os.environ.get("CONTEXT_DEV_API_KEY")
         if not key_: sys.exit("Set CONTEXT_DEV_API_KEY first.")
         print("Looking for %s's own page for %s v %s through Context.dev (search, then a read with extraction) ..." % (a.book, a.home, a.away))
         t0 = time.time()
-        status, link, text, there = ctx_confirm_at_source(key_, a.book, a.home, a.away, a.price, a.outcome)
+        known_ = next((u for lg_, u in (book_pages().get(re.sub(r"[^a-z0-9]", "", a.book.lower())) or {}).items()), "") if a.league == "any" else \
+            (book_pages().get(re.sub(r"[^a-z0-9]", "", a.book.lower())) or {}).get(a.league.strip("/").lower(), "")
+        if known_: print("  using the known league page: %s" % known_)
+        status, link, text, there = ctx_confirm_at_source(key_, a.book, a.home, a.away, a.price, a.outcome, known=known_)
         print({"seen": "SAME PRICE on the bookmaker's own site", "moved": "Match page found. It shows a DIFFERENT price",
                "not shown": "Match page found, but its price could not be read", "unreadable": "No page for this match could be found or opened",
+               "not listed": "Pages on the bookmaker's site were read, but this match was not on them",
+               "no page": "No page for this match was found on the bookmaker's site", "blocked": "A page was found but it would not open",
                "no site": "This bookmaker's site is not in the list"}[status])
         print("  price there: %s   (you gave %.2f)" % (("%.2f" % there) if there else "not read", a.price))
         print("  page: %s" % (link or "none"))
@@ -2954,6 +4027,9 @@ def main():
         save("hubs.json", sorted(set(load("hubs.json", []) + hubs)))
         added = run_hub(eng, ckey, hubs, tested=a.tested, default_kick=parse_kickoff(a.kickoff), limit=(max(a.max, 150) if a.deep else a.max),
                         workers=a.workers, deep=a.deep, within_h=a.within_hours, research=not a.deep)
+        old = load("hub_opts.json", {})                             # the running app repeats this same sweep on its own
+        save("hub_opts.json", {"deep": bool(a.deep or old.get("deep")), "within_h": max(a.within_hours if a.deep else 0, old.get("within_h", 0)) or 30,
+                               "last": time.time(), "added": added})
         print("\n%d new match(es) watched, %d in total. Took %.0f seconds. Start the dashboard with: python app.py serve"
               % (added, len(eng.watch), time.time() - t0))
         return
@@ -3093,9 +4169,19 @@ def main():
         eng = Engine(odds_key=okey, ctx_key=ckey, interval=max(60.0, a.minutes * 60), regions=a.regions, in_play=a.in_play)
         eng.pot_start, eng.stake_pct = a.pot, a.stake_pct
         eng.alert_min = a.alert_min
+        eng.window_h = max(0, int(a.window_hours)) if a.window_hours == int(a.window_hours) else max(0.0, a.window_hours)
+        print(("Only matches kicking off within %g hours are flagged and recorded. To lift this:  python app.py serve --window-hours 0" % eng.window_h) if eng.window_h
+              else "No kick-off window: matches any time ahead can be flagged and recorded.")
+        eng.public = bool(a.public)
+        if a.public: print("Shared mode: pages cannot be added from the dashboard, and Read now is limited to one every 8 seconds.")
+        rw_, aw_ = [(os.environ.get(k_) or "").strip().strip('"') for k_ in ("OFFSIDE_RESULTS_WEBHOOK", "OFFSIDE_WEBHOOK")]
+        if rw_ and rw_ == aw_: print("Results: OFFSIDE_RESULTS_WEBHOOK is the SAME address as the alerts webhook, so results will land in the alerts channel.")
+        elif rw_ and "discord" in rw_: print("Results ON: finished matches are posted to the results channel.")
+        elif aw_: print("Results: no separate results webhook is set in this window, so finished matches are posted to the alerts channel.")
         eng.parallel = max(1, min(40, a.parallel))
         if os.environ.get("OFFSIDE_WEBHOOK"): print("Alerts ON: posting to the chat webhook, for prices passing minus %d or stricter." % a.alert_min)
         if a.ntfy: os.environ["OFFSIDE_NTFY"] = a.ntfy
+        if a.invite: os.environ["OFFSIDE_DISCORD_INVITE"] = a.invite
         if os.environ.get("OFFSIDE_NTFY"): print("Phone alerts ON: ntfy topic '%s'." % os.environ["OFFSIDE_NTFY"])
         if os.environ.get("TWILIO_SID") and os.environ.get("OFFSIDE_SMS_TO"): print("Text messages ON: to %s." % os.environ["OFFSIDE_SMS_TO"])
         if eng.leagues and not okey:
@@ -3104,6 +4190,15 @@ def main():
             sys.exit("Odds pages are being watched but CONTEXT_DEV_API_KEY is not set.")
         cost = len(eng.leagues) * len(a.regions.split(","))
         stop = threading.Event()
+        if ckey:                                                        # bookmaker logos not fetched yet, in the background
+            def _logos():
+                try:
+                    before = sum(1 for v in brands().values() if v.get("icon"))
+                    n_ = fetch_brands(ckey, log=lambda *x: None)
+                    if n_ != before: print("  %s  bookmaker logos: %d sites now have one, from Context.dev's brand data" % (time.strftime("%H:%M:%S"), n_))
+                except Exception as e:
+                    print("  bookmaker logos could not be fetched: %s" % str(e)[:140])
+            threading.Thread(target=_logos, daemon=True).start()
         threading.Thread(target=run_loop, args=(eng, stop, a.rediscover_hours), daemon=True).start()
         srv = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(eng))
         print("Offside (version %s) is running. Open http://127.0.0.1:%d in your browser. Ctrl+C to stop." % (VERSION, a.port))

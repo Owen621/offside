@@ -1,0 +1,14 @@
+# data the app creates while running
+offside_data/
+odds_data/
+odds_backtest.txt
+scan_log.json
+scan_last_page.md
+
+# Python
+__pycache__/
+*.pyc
+
+# never commit keys
+.env
+*.key

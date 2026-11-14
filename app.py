@@ -37,7 +37,7 @@ Nothing here places a bet.
 import argparse
 import datetime as dt
 import hashlib
-import json
+import json, math
 import os
 import random
 import re
@@ -52,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import odds
 import scan
 
-VERSION = "build 12"          # shown at start-up and at the foot of the dashboard
+VERSION = "build 13"          # shown at start-up and at the foot of the dashboard
 DATA = "offside_data"
 ODDS_API = "https://api.the-odds-api.com/v4"
 EXCHANGE = re.compile(r"betfair_ex|matchbook|smarkets|exchange", re.I)     # exchanges are not bookmaker prices
@@ -1674,6 +1674,27 @@ class Engine:
             with self.lock: self._save("record.json", self.record)
 
     # ----- what the dashboard shows
+    def _field(self, e):
+        """Every bookmaker's price for the result a live row is about, lowest first."""
+        g = self.last_good.get(e.get("url") or "")
+        if not g: return []
+        i = {"home": 0, "draw": 1, "away": 2}[e["outcome"]]
+        return sorted(([k, round(v[i], 3)] for k, v in g["m"]["books"].items()), key=lambda x: x[1])
+
+    def _closest(self):
+        """The upcoming match whose best price is nearest the line, with every bookmaker's price for that result."""
+        best = None
+        for row in self.matches:
+            n = row.get("nearest")
+            if n and row.get("kickoff") and row["kickoff"] > self.now() and row.get("avg") and (best is None or n["ratio"] > best["nearest"]["ratio"]):
+                best = row
+        if not best: return None
+        n = best["nearest"]; i = {"home": 0, "draw": 1, "away": 2}[n["outcome"]]
+        e = {"home": best["home"], "away": best["away"], "kickoff": best["kickoff"], "scope": best.get("scope"), "url": best.get("url") or "",
+             "book": n["book"], "outcome": n["outcome"], "price": n["price"], "needed": n["needed"], "average": best["avg"][i]}
+        e["field"] = self._field(e)
+        return e
+
     def _book_page(self, e):
         """What is known about the bookmaker's own page for a live row: its address, what the check found, the price there."""
         rec = next((r for r in self.record if r["mid"] == e["mid"] and r["book"] == e["book"] and r["outcome"] == e["outcome"]), None)
@@ -1708,7 +1729,8 @@ class Engine:
                     "has_odds_key": bool(self.odds_key), "has_ctx_key": bool(self.ctx_key),
                     "leagues": [dict(l, source=self.sources.get(l["key"], {})) for l in self.leagues],
                     "pages": [dict(w, source=self.sources.get(w["url"], {})) for w in self.watch],
-                    "live": [dict(e, **self._book_page(e)) for e in self.live], "matches": list(self.matches)[:80], "record": list(reversed(self.record)),
+                    "live": [dict(e, field=self._field(e), **self._book_page(e)) for e in self.live], "matches": list(self.matches)[:80], "record": list(reversed(self.record)),
+                    "closest": self._closest(),
                     "summary": {"recorded": len(self.record), "settled": len(settled),
                                 "won": sum(1 for r in settled if r["result"] == "won"), "profit": round(profit, 2),
                                 "roi": (profit / len(settled)) if settled else None},
@@ -1777,153 +1799,270 @@ def load_backtest_matches(first=2015, last=2026):
 
 
 # --------------------------------------------------------------------------- the dashboard page
+README_MARKS = ("<!-- evidence:start -->", "<!-- evidence:end -->")
+
+
+def readme_block(ev):
+    """The 'does the rule hold up' section of the README: the same test results shown per bet, in total, per year and on a bank."""
+    S = ev.get("settings") or {}
+    keys = [k for k in ("3", "4", "5") if k in S]
+    if not keys: return ""
+    title = {"3": "Loose (minus 3)", "4": "Medium (minus 4)", "5": "Strict (minus 5)"}
+    yrs = S[keys[0]].get("years") or 0
+    month = lambda iso: dt.date.fromisoformat(iso).strftime("%B %Y") if iso else ""
+    sp = ev.get("split") or ""; sp = (sp[:2] + "/" + sp[2:]) if sp else "the midpoint"
+    pc = lambda x: None if x is None else "%+.1f%%" % (100 * x)
+    gbp = lambda x: None if x is None else ("-" if x < 0 else "+") + "£{:,.0f}".format(abs(round(x)))
+    units = lambda s: s["units"] if s.get("units") is not None else s["roi"] * s["bets"]
+    bank = lambda s: (s.get("pot") or [{}])[0]
+    todo = "filled in by `python app.py evidence`"
+    whole = lambda x: int(math.floor(abs(x) + 0.5)) * (1 if x >= 0 else -1)
+    signed = lambda x: "0" if whole(x) == 0 else "%+d" % whole(x)
+    def row(label, fn):
+        cells = []
+        for k in keys:
+            try: v = fn(S[k])
+            except Exception: v = None
+            cells.append(todo if v is None else v)
+        return "| %s | %s |" % (label, " | ".join(cells))
+    L = ["`odds.py` tests the rule on %s matches in %d European leagues, %s to %s (%.1f years), using only mainstream bookmakers named in the data, "
+         "with no betting exchanges. The rule and its settings were published in 2017 using data up to 2015. Every match in this test was played "
+         "after that, so the rule could not have been fitted to it." % ("{:,}".format(ev.get("matches", 0)), ev.get("leagues", 0), month(ev.get("first")), month(ev.get("last")), yrs), "",
+         "**The return is per bet, on the money staked each time. It is not a yearly figure and it is not the return over the whole period.** "
+         "A bet settles in about two hours, so the same money is staked again and again. The table shows the same result in every form.", ""]
+    m = S.get("4")
+    if m and bank(m).get("total") is not None:
+        L += ["At the medium setting the rule returned **%s on every bet** over %s bets. Staking £20 a bet from a £1,000 bank, that is %s in total, "
+              "an average of **%+d%% a year** on the bank%s." % (pc(m["roi"]), "{:,}".format(m["bets"]), gbp(bank(m)["total"]), round(bank(m)["per_year_pct"]),
+                                                                (", with %d winning seasons out of %d" % (m["winning_seasons"], m["n_seasons"])) if m.get("winning_seasons") is not None else ""), ""]
+    L += [
+         "| | " + " | ".join(title[k] for k in keys) + " |", "|---|" + "---|" * len(keys),
+         row("**Return on every bet**, on the money staked", lambda s: "**%s**" % pc(s["roi"])),
+         row("Bets in the test", lambda s: "{:,}".format(s["bets"])),
+         row("Bets a year", lambda s: "about %d" % round(s["bets"] / yrs)),
+         row("Total profit, staking 1 unit a bet", lambda s: "%s units" % signed(units(s))),
+         row("Total profit at £100 a bet", lambda s: gbp(units(s) * 100)),
+         row("Profit a year at £100 a bet", lambda s: "about " + gbp(units(s) * 100 / yrs)),
+         row("A £1,000 bank staking £20 a bet: total profit", lambda s: gbp(bank(s).get("total"))),
+         row("The same bank: **average return a year**", lambda s: None if bank(s).get("per_year_pct") is None else "**%+d%%**" % round(bank(s)["per_year_pct"])),
+         row("The same bank: worst season", lambda s: gbp(bank(s).get("worst_season"))),
+         row("Seasons that made money", lambda s: None if s.get("winning_seasons") is None else "%d of %d" % (s["winning_seasons"], s["n_seasons"])),
+         row("t statistic (above 2 is unlikely to be luck)", lambda s: None if s.get("t") is None else "%.2f" % s["t"]),
+         row("Per bet, seasons before %s" % sp, lambda s: pc(s.get("older_roi"))),
+         row("Per bet, seasons from %s" % sp, lambda s: pc(s.get("newer_roi"))), ""]
+    if ev.get("baseline_roi") is not None:
+        L += ["For comparison, betting every result at the average price over the same matches returned %s per bet. That is the bookmakers' margin. "
+              "A return of 2%% to 5%% per bet is usually thought of as a good long-run result for a professional." % pc(ev["baseline_roi"]), ""]
+    L += ["How to read it:", "",
+          "- The looser the setting, the more often it bets and the thinner the edge on each bet. The stricter settings bet rarely, at a higher return per bet.",
+          "- The bank rows use flat stakes with no compounding. They assume the recorded price was available every time and the account was never limited. "
+          "Bookmakers do limit accounts that win this way, so capacity is the practical ceiling, not the edge.",
+          "- A single season has few bets, so one season on its own proves little. The totals are the evidence.", ""]
+    with_seasons = [k for k in keys if S[k].get("seasons")]
+    if with_seasons:
+        L += ["Season by season, profit in units at 1 unit a bet (number of bets in brackets):", "",
+              "| Season | " + " | ".join(title[k] for k in with_seasons) + " |", "|---|" + "---|" * len(with_seasons)]
+        for n, first in enumerate(S[with_seasons[0]]["seasons"]):
+            cells = []
+            for k in with_seasons:
+                x = S[k]["seasons"][n] if n < len(S[k]["seasons"]) else None
+                cells.append("%s (%d)" % (signed(x["units"]), x["bets"]) if x else "")
+            L.append("| %s | %s |" % (first["season"], " | ".join(cells)))
+        L.append("")
+    return "\n".join(L).rstrip()
+
+
+def refresh_readme(ev, path="README.md"):
+    """Rewrite the results section of the README from the test data. Returns True if the file changed."""
+    if not os.path.exists(path): return False
+    txt = open(path, encoding="utf-8").read()
+    a, b = README_MARKS
+    if a not in txt or b not in txt: return False
+    new = txt[:txt.index(a) + len(a)] + "\n" + readme_block(ev) + "\n" + txt[txt.index(b):]
+    if new == txt: return False
+    with open(path, "w", encoding="utf-8", newline="\n") as f: f.write(new)
+    return True
+
+
+
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Offside</title>
 <style>
-:root{--paper:#EEF2F7;--panel:#FFFFFF;--ink:#14213D;--muted:#57667E;--line:#D3DBE7;--soft:#E6ECF4;--card:#F2B705;--card-ink:#2E2200;
---win:#1B7F4F;--loss:#C8102E;--chart2:#8C9DB6;--top:#14213D;--top-ink:#F4F7FB;--top-muted:#AEBBD0;color-scheme:light}
-@media (prefers-color-scheme:dark){:root{--paper:#0B1220;--panel:#141E33;--ink:#EAF0F8;--muted:#9BABC2;--line:#28365380;--soft:#1B2740;
---win:#57C793;--loss:#FF7084;--chart2:#62748F;--top:#070C17;--top-ink:#F4F7FB;--top-muted:#9BABC2;color-scheme:dark}}
+:root{--paper:#000;--panel:#0c0d0f;--soft:#16181b;--line:#25282c;--ink:#f3f4f5;--muted:#a3a9af;--card:#ffd21f;--card-ink:#1b1500;
+--win:#62d26f;--accent:#408737;--loss:#ff5d62;--chart2:#8b95ff;--top:#0c0d0f;--top-ink:#f3f4f5;--top-muted:#a3a9af;--r:26px;color-scheme:dark}
 *{box-sizing:border-box}
-html{font-size:17px}
-body{margin:0;background:var(--paper);color:var(--ink);font:1rem/1.5 "Segoe UI",system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif}
-.d,h1,h2,h3,th{font-family:Bahnschrift,"DIN Alternate","Roboto Condensed","Arial Narrow",Arial,sans-serif}
-.in{max-width:1280px;margin:0 auto;padding:0 28px}
-.top{background:var(--top);color:var(--top-ink)}
-.top .in{display:flex;flex-wrap:wrap;gap:16px 48px;align-items:center;justify-content:space-between;padding-top:26px;padding-bottom:26px}
-.brand{display:flex;align-items:center;gap:18px}
-.flag{width:46px;height:36px;flex:none;background:
- conic-gradient(var(--card) 0 25%, var(--loss) 0 50%, var(--card) 0 75%, var(--loss) 0) 0 0/100% 100%;border-radius:2px;transform:rotate(-8deg)}
-h1{font-size:3.4rem;line-height:1;margin:0;font-weight:700;letter-spacing:.5px}
-.tagline{margin:4px 0 0;color:var(--top-muted);max-width:46ch}
-.status{font-size:.9rem;color:var(--top-muted);line-height:1.6}
-.status b{color:var(--top-ink);font-weight:600}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--win);margin-right:8px;vertical-align:1px}
-.dot.off{background:var(--loss)}
-main{padding-bottom:70px}
-section{margin-top:44px}
-h2{font-size:1.9rem;margin:0;font-weight:600;line-height:1.15}
-h3{font-size:1.25rem;margin:0 0 6px;font-weight:600}
-.sub{color:var(--muted);margin:6px 0 16px;max-width:74ch}
-.scroll{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:4px}
-table{border-collapse:collapse;width:100%;min-width:820px}
-thead th{background:var(--soft);text-align:left;font-weight:600;font-size:.95rem;color:var(--muted);padding:11px 12px;white-space:nowrap}
-td{padding:13px 12px;border-top:1px solid var(--line);vertical-align:middle}
-.num{font-family:Bahnschrift,"DIN Alternate","Roboto Condensed","Arial Narrow",Arial,sans-serif;font-variant-numeric:tabular-nums;font-size:1.2rem}
-.match{font-weight:600}.small{font-size:.8rem;color:var(--muted)}
-.nw{white-space:nowrap}td.when{white-space:nowrap;width:1%}td.m{min-width:190px}td.st{min-width:200px;max-width:250px}td.st .tag,td.m .tag{white-space:normal;display:inline-block;border-radius:8px;line-height:1.3;padding:2px 8px}
-.yc{display:inline-block;background:var(--card);color:var(--card-ink);font-family:Bahnschrift,"DIN Alternate","Arial Narrow",Arial,sans-serif;
-font-size:1.5rem;font-weight:700;font-variant-numeric:tabular-nums;padding:12px 10px 9px;min-width:66px;text-align:center;border-radius:4px;
-box-shadow:3px 3px 0 rgba(20,33,61,.22);transform:rotate(-3deg)}
-.rc{display:inline-block;background:var(--loss);color:#fff;padding:2px 9px;border-radius:3px;font-weight:600;font-size:.85rem}
-.won{color:var(--win);font-weight:700}.pos{color:var(--win)}.neg{color:var(--loss)}
-.tag{font-size:.78rem;border:1px solid var(--line);padding:1px 8px;border-radius:10px;color:var(--muted);white-space:nowrap}
-.tag.ok{border-color:var(--win);color:var(--win)}
-tr.fresh td{animation:fresh 2.4s ease-out 1}
-@keyframes fresh{from{background:rgba(242,183,5,.4)}to{background:transparent}}
-@media (prefers-reduced-motion:reduce){tr.fresh td{animation:none}}
-.quiet{padding:26px 24px;display:flex;gap:22px;align-items:center}
-.quiet .big{font-family:Bahnschrift,"DIN Alternate","Arial Narrow",Arial,sans-serif;font-size:1.45rem;font-weight:600}
-.quiet p{margin:4px 0 0;color:var(--muted);max-width:70ch}
-.ghost{width:58px;height:78px;border:2px dashed var(--line);border-radius:4px;flex:none;transform:rotate(-3deg)}
-.setup{padding:24px}.setup code{background:var(--soft);padding:2px 6px;border-radius:3px;font-size:.88rem}
-.meter{display:inline-block;width:120px;height:8px;background:var(--soft);border-radius:4px;overflow:hidden;vertical-align:middle;margin-right:8px}
-.meter i{display:block;height:100%;background:var(--chart2)}.meter.hot i{background:var(--card)}
-form{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
-input[type=url]{flex:1 1 340px;padding:11px 13px;font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:4px}
-button{font:inherit;font-weight:600;padding:11px 18px;border:2px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;border-radius:4px}
-.seg{display:inline-flex;border:2px solid var(--ink);border-radius:4px;overflow:hidden}
-.seg button{border:0;border-radius:0;background:transparent;color:var(--ink);padding:9px 16px}
-.seg button+button{border-left:2px solid var(--ink)}
-.seg button[aria-pressed=true]{background:var(--ink);color:var(--paper)}
-button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid var(--card);outline-offset:2px}
-.grid{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:28px;align-items:start}
-@media (max-width:940px){.grid{grid-template-columns:1fr}h1{font-size:2.5rem}}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:22px}
-.figs{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px 26px;margin:18px 0 10px}
-.figs span{display:block;font-size:.8rem;color:var(--muted);line-height:1.3;margin-top:2px}
-.figs b{font-family:Bahnschrift,"DIN Alternate","Arial Narrow",Arial,sans-serif;font-size:2.1rem;font-weight:600;font-variant-numeric:tabular-nums;line-height:1}
-svg{display:block;width:100%;height:auto}
-.work{display:flex;flex-wrap:wrap;gap:10px 34px;margin-top:14px;padding:16px 20px;background:var(--panel);border:1px solid var(--line);border-radius:4px}
-.work b{font-family:Bahnschrift,"DIN Alternate","Arial Narrow",Arial,sans-serif;font-size:1.5rem;font-weight:600;font-variant-numeric:tabular-nums;display:block;line-height:1.1}
-.work span{font-size:.8rem;color:var(--muted)}
-.spark{display:block;width:150px;height:34px}
-.pot{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px 28px;padding:18px 20px;background:var(--top);color:var(--top-ink);border-radius:4px;margin-bottom:14px}
-.pot b{font-family:Bahnschrift,"DIN Alternate","Arial Narrow",Arial,sans-serif;font-size:1.9rem;font-weight:600;font-variant-numeric:tabular-nums;display:block;line-height:1.1}
-.pot span{font-size:.8rem;color:var(--top-muted)}
-.feed{font-size:.86rem;line-height:1.75;padding:14px 18px;max-height:300px;overflow:auto;font-variant-numeric:tabular-nums}
-.feed .ok{color:var(--win);font-weight:600}.feed .bad{color:var(--loss);font-weight:600}
-button.mini{padding:4px 10px;font-size:.78rem;border-width:1px;background:transparent;color:var(--ink);margin-top:6px}
-button.mini[disabled]{opacity:.55;cursor:default}
-a.go{display:inline-block;padding:5px 11px;border-radius:3px;background:var(--ink);color:var(--paper,#fff);font-weight:600;font-size:.84rem;text-decoration:none}
-a.go:hover,a.go:focus{outline:2px solid var(--card,#f5c400);outline-offset:1px}
-.thumb{display:block;width:92px;height:58px;object-fit:cover;object-position:top;border:1px solid var(--line);border-radius:3px}
-.key{display:flex;flex-wrap:wrap;gap:6px 24px;font-size:.85rem;color:var(--muted);margin-top:10px}
-.key i{display:inline-block;width:24px;height:3px;vertical-align:middle;margin-right:7px}
-ol,ul{padding-left:20px;margin:8px 0}li{margin:7px 0;max-width:68ch}
+html{font-size:15.5px;scroll-behavior:smooth;scroll-padding-top:86px}
+body{margin:0;background:var(--paper);color:var(--ink);font:1rem/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI Variable Text","Segoe UI",system-ui,Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}
+.in{max-width:1360px;margin:0 auto;padding:0 22px}
 a{color:inherit}
-footer{margin-top:48px;font-size:.8rem;color:var(--muted);border-top:1px solid var(--line);padding-top:16px}
+/* top bar */
+.top{position:sticky;top:0;z-index:20;background:rgba(0,0,0,.86);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+.bar{display:flex;align-items:center;gap:14px 26px;flex-wrap:wrap;padding-top:12px;padding-bottom:12px}
+.brand{display:flex;align-items:center;gap:12px;text-decoration:none}
+.flag{width:30px;height:24px;flex:none;border-radius:3px;transform:rotate(-8deg);
+ background:conic-gradient(var(--card) 0 25%, var(--loss) 0 50%, var(--card) 0 75%, var(--loss) 0)}
+h1{font-size:1.5rem;line-height:1;margin:0;font-weight:800;letter-spacing:-.02em}
+.tabs{display:flex;gap:6px;flex-wrap:wrap}
+.tabs a{text-decoration:none;font-weight:600;font-size:.9rem;padding:7px 15px;border-radius:999px;color:var(--muted);border:1px solid transparent}
+.tabs a:hover{color:var(--ink);border-color:var(--line)}
+.status{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;font-size:.84rem}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:6px 13px;border-radius:999px;background:var(--soft);border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.pill b{color:var(--ink);font-weight:700;font-variant-numeric:tabular-nums}
+.pill.warn{border-color:#5c4a12;color:var(--card)}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--win);flex:none;box-shadow:0 0 0 0 rgba(98,210,111,.55);animation:pulse 2.2s ease-out infinite}
+.dot.off{background:var(--loss);animation:none}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(98,210,111,.55)}70%{box-shadow:0 0 0 9px rgba(98,210,111,0)}100%{box-shadow:0 0 0 0 rgba(98,210,111,0)}}
+/* cards */
+main{padding:18px 0 70px}
+.bento{display:grid;grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);gap:18px;align-items:start;margin-top:18px}
+.bento.even{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+.side{display:grid;gap:18px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:24px 24px 26px;margin-top:18px;min-width:0}
+.bento>.card,.side>.card{margin-top:0}
+h2{font-size:1.68rem;margin:0;font-weight:800;line-height:1.15;letter-spacing:-.015em}
+h2.h3,h3{font-size:1.18rem;margin:0 0 4px;font-weight:800;letter-spacing:-.01em}
+.sub{color:var(--muted);margin:6px 0 16px;max-width:72ch}
+.small{font-size:.8rem;color:var(--muted)}
+.num{font-variant-numeric:tabular-nums;font-size:1.1rem;font-weight:700}
+.match{font-weight:700}.nw{white-space:nowrap}
+.won{color:var(--win);font-weight:800}.pos{color:var(--win)}.neg{color:var(--loss)}
+/* the hero: one block per price that is out of line */
+.flagrow{background:var(--soft);border:1px solid var(--line);border-radius:20px;padding:20px 22px 18px;margin-top:14px}
+.flagrow.fresh{animation:fresh 2.6s ease-out 1}
+@keyframes fresh{from{border-color:var(--card);box-shadow:0 0 0 3px rgba(255,210,31,.35)}to{border-color:var(--line);box-shadow:0 0 0 0 rgba(255,210,31,0)}}
+.fl-top{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}
+.fl-what{font-size:1.5rem;font-weight:800;line-height:1.2;letter-spacing:-.015em;margin-top:2px}
+.fl-match{color:var(--muted);font-weight:600}
+.fl-price{text-align:right;flex:none}
+.yc{display:inline-block;background:var(--card);color:var(--card-ink);font-size:1.45rem;font-weight:800;font-variant-numeric:tabular-nums;
+ padding:10px 12px 9px;min-width:68px;text-align:center;border-radius:8px;transform:rotate(-3deg)}
+.fl-price .yc{font-size:2.5rem;padding:12px 18px 10px;border-radius:11px;margin-bottom:8px}
+svg{display:block;width:100%;height:auto}
+.strip{margin:12px 0 4px}
+.fl-foot{display:flex;flex-wrap:wrap;gap:8px 10px;align-items:center;margin-top:10px}
+.news{margin-top:10px;max-width:80ch}
+a.go{display:inline-block;padding:8px 17px;border-radius:999px;background:var(--accent);color:#fff;font-weight:700;font-size:.9rem;text-decoration:none}
+a.go:hover{background:#4a9a40}
+.lnk{font-size:.86rem;color:var(--muted)}
+.tag{display:inline-block;font-size:.78rem;border:1px solid var(--line);padding:2px 10px;border-radius:999px;color:var(--muted);white-space:nowrap;line-height:1.5}
+.tag.ok{border-color:#2f6a36;color:var(--win)}
+.rc{display:inline-block;background:var(--loss);color:#1a0406;padding:2px 10px;border-radius:999px;font-weight:800;font-size:.84rem;white-space:nowrap}
+.quiet{display:flex;gap:20px;align-items:center;background:var(--soft);border:1px solid var(--line);border-radius:20px;padding:24px;margin-top:14px}
+.quiet .big{font-size:1.35rem;font-weight:800;letter-spacing:-.01em}
+.quiet p{margin:5px 0 0;color:var(--muted);max-width:70ch}
+.ghost{width:52px;height:70px;border:2px dashed #3a3f45;border-radius:8px;flex:none;transform:rotate(-3deg)}
+.setup{padding:22px;color:var(--muted)}.setup code{background:var(--soft);padding:2px 7px;border-radius:6px;font-size:.88rem;color:var(--ink)}
+/* the ticker and the tiles */
+.feed{max-height:392px;overflow:auto;margin:0 -8px;padding:0 8px;font-variant-numeric:tabular-nums}
+.fd{display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 11px;padding:10px 0;border-top:1px solid var(--line)}
+.fd:first-child{border-top:0}
+.fd i{width:8px;height:8px;border-radius:50%;background:var(--win);margin-top:7px}
+.fd.bad i{background:var(--loss)}
+.fd b{font-weight:700}.fd .t{color:var(--muted);font-weight:500;margin-left:6px;font-size:.84rem}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:10px}
+.tiles>div{background:var(--soft);border:1px solid var(--line);border-radius:18px;padding:14px 16px}
+.tiles b{display:block;font-size:1.55rem;font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.tiles span{display:block;font-size:.8rem;color:var(--muted);line-height:1.35;margin-top:4px}
+.tiles.big b{font-size:1.9rem}
+/* tables */
+.scroll{overflow:auto;border:1px solid var(--line);border-radius:18px;background:var(--panel)}
+.scroll.tall{max-height:640px}
+table{border-collapse:collapse;width:100%;min-width:820px}
+thead th{position:sticky;top:0;z-index:1;background:var(--soft);text-align:left;font-weight:600;font-size:.84rem;color:var(--muted);padding:11px 14px;white-space:nowrap}
+td{padding:13px 14px;border-top:1px solid var(--line);vertical-align:middle}
+tbody tr:hover td{background:rgba(255,255,255,.022)}
+td.when{white-space:nowrap;width:1%}td.m{min-width:190px}td.st{min-width:200px;max-width:260px}
+td.st .tag,td.m .tag{white-space:normal;border-radius:12px;line-height:1.35;padding:3px 10px}
+.meter{display:inline-block;width:120px;height:8px;background:var(--soft);border-radius:999px;overflow:hidden;vertical-align:middle;margin-right:9px;border:1px solid var(--line)}
+.meter i{display:block;height:100%;background:var(--chart2)}.meter.hot i{background:var(--card)}
+.spark{display:block;width:150px;height:34px}
+.thumb{display:block;width:96px;height:60px;object-fit:cover;object-position:top;border:1px solid var(--line);border-radius:10px}
+/* controls */
+button{font:inherit;font-weight:700;padding:9px 17px;border:1px solid var(--line);background:var(--soft);color:var(--ink);cursor:pointer;border-radius:999px}
+button:hover{border-color:#4a5057}
+button.mini{padding:5px 13px;font-size:.8rem;margin-top:7px;background:transparent}
+button.mini[disabled]{opacity:.55;cursor:default}
+.seg{display:inline-flex;gap:6px;flex-wrap:wrap}
+.seg button{background:transparent;color:var(--muted);padding:8px 16px}
+.seg button[aria-pressed=true]{background:var(--ink);color:#000;border-color:var(--ink)}
+button:focus-visible,a:focus-visible{outline:3px solid var(--card);outline-offset:2px}
+.acts{display:flex;flex-wrap:wrap;gap:8px 10px;align-items:center;margin:0 0 14px}
+.acts button.mini{margin:0}
+.key{display:flex;flex-wrap:wrap;gap:6px 24px;font-size:.85rem;color:var(--muted);margin-top:10px}
+.key i{display:inline-block;width:24px;height:3px;border-radius:2px;vertical-align:middle;margin-right:7px}
+ol,ul{padding-left:20px;margin:8px 0}li{margin:8px 0;max-width:68ch;color:#d6d9dc}
+footer{margin-top:34px;font-size:.8rem;color:var(--muted);padding:0 6px}
+@media (max-width:1040px){.bento,.bento.even{grid-template-columns:1fr}}
+@media (max-width:760px){.tabs{display:none}.fl-top{flex-direction:column}.fl-price{text-align:left}.card{padding:20px 16px 22px;border-radius:20px}html{font-size:15px}}
+@media (prefers-reduced-motion:reduce){.dot,.flagrow.fresh{animation:none}html{scroll-behavior:auto}}
 </style></head><body>
-<div class="top"><div class="in"><div class="brand"><div class="flag" aria-hidden="true"></div><div><h1>Offside</h1>
-<p class="tagline">Bookmaker prices that are out of line with everyone else's, found before kick-off.</p></div></div>
-<div class="status" id="status" role="status">Starting…</div></div></div>
+<header class="top"><div class="in bar">
+<a class="brand" href="#h-live" aria-label="Offside, top of page"><span class="flag" aria-hidden="true"></span><h1>Offside</h1></a>
+<nav class="tabs" aria-label="Sections"><a href="#h-live">Live</a><a href="#h-seen">Earlier</a><a href="#h-all">Watching</a><a href="#h-rec">Record</a><a href="#h-ev">Evidence</a></nav>
+<div class="status" id="status" role="status"><span class="pill">Starting…</span></div>
+</div></header>
 <main class="in">
-<section aria-labelledby="h-live"><h2 id="h-live">Out of line right now</h2>
-<p class="sub">Each row is one bookmaker paying clearly more than the average of all the others for the same result.
-To act on a row you would back that result at that bookmaker yourself, at that price. Offside reads the page again about a minute later and records the price, as one unit staked, only if it is still there.</p>
-<div class="scroll" id="live"></div>
-<div class="work" id="work" style="display:none" aria-label="What Context.dev has done since switch-on"></div></section>
+<div class="bento">
+<section class="card" aria-labelledby="h-live"><h2 id="h-live">Out of line right now</h2>
+<p class="sub">One bookmaker paying clearly more than all the others for the same result. Each price is read again a minute later before it counts.</p>
+<div id="live"></div></section>
+<div class="side">
+<section class="card" aria-labelledby="h-feed"><h2 class="h3" id="h-feed">Live reads</h2>
+<p class="sub" style="margin-bottom:8px">Each line is one odds page fetched fresh from the site through Context.dev, as it happens.</p>
+<div class="feed" id="feed"></div></section>
+<section class="card" id="workcard" style="display:none" aria-labelledby="h-work"><h2 class="h3" id="h-work">Since switch-on</h2>
+<div class="tiles" id="work" style="margin-top:12px"></div></section>
+</div></div>
 
-<section aria-labelledby="h-feed"><h2 id="h-feed">Live reads</h2>
-<p class="sub">Every read as it happens: the match, how many bookmakers came back, how long Context.dev took, and its request id. "Fresh" means the page was fetched from the site for this read, not served from a cache. Use "Read now" on any match to trigger one yourself.</p>
-<div class="scroll feed" id="feed"></div></section>
+<section class="card" aria-labelledby="h-seen"><h2 id="h-seen">Out of line earlier</h2>
+<p class="sub">Every price that has been out of line in the last day and a half, and what became of it.</p>
+<div class="scroll tall" id="seen"></div></section>
 
-<section aria-labelledby="h-seen"><h2 id="h-seen">Out of line earlier</h2>
-<p class="sub">Every price that has been out of line in the last day and a half, whether or not it lasted long enough to be recorded.</p>
-<div class="scroll" id="seen"></div></section>
+<section class="card" aria-labelledby="h-all"><h2 id="h-all">Every match being watched</h2>
+<p class="sub" id="allsub"></p><div class="scroll tall" id="all"></div></section>
 
-<section aria-labelledby="h-all"><h2 id="h-all">Every match being watched</h2>
-<p class="sub" id="allsub"></p><div class="scroll" id="all"></div>
-</section>
+<section class="card" aria-labelledby="h-rec"><h2 id="h-rec">The system's record</h2>
+<p class="sub">One shared record for everyone using Offside, not a personal account. It shows what would have happened if every result Offside confirmed had been backed once, at the price recorded, with 2% of a bank of 1,000. No real money is involved. Each entry keeps a screenshot, the saved page and Context.dev's request id as proof.</p>
+<div class="acts"><button type="button" class="mini" id="notif">Turn on alerts in this browser</button><span class="small" id="notifmsg"></span>
+<button type="button" class="mini" id="settle">Check results now</button><span class="small" id="settlemsg"></span></div>
+<div class="tiles big" id="paper" style="margin-bottom:14px"></div>
+<p class="sub" id="recsub" style="max-width:96ch"></p><div class="scroll" id="record"></div></section>
 
-<section aria-labelledby="h-ev"><h2 id="h-ev">Does this rule hold up?</h2>
+<div class="bento">
+<section class="card" aria-labelledby="h-ev"><h2 id="h-ev">Does the rule hold up?</h2>
 <p class="sub" id="evsub"></p>
-<div class="grid"><div class="panel"><div class="seg" id="switch" role="group" aria-label="How strict the rule is"></div>
-<div class="figs" id="figs"></div><p class="small" id="tnote" style="margin:0 0 14px"></p><div id="chart"></div>
+<div class="seg" id="switch" role="group" aria-label="How strict the rule is"></div>
+<div class="tiles big" id="figs" style="margin:16px 0 10px"></div><p class="small" id="tnote" style="margin:0 0 16px;max-width:90ch"></p><div id="chart"></div>
 <div class="key"><span><i style="background:var(--win)"></i>Betting the out-of-line price</span>
 <span><i style="background:var(--chart2)"></i>The same bets at the average price</span></div>
-<h3 style="margin-top:26px">Season by season</h3><p class="small" id="seasnote" style="margin:0 0 8px"></p><div id="seasons"></div>
-<h3 style="margin-top:26px">What that means for a pot of money</h3><div id="pot"></div></div>
-<div class="panel"><h3>How to read the chart</h3>
+<h3 style="margin-top:28px">Season by season</h3><p class="small" id="seasnote" style="margin:0 0 8px"></p><div id="seasons"></div>
+<h3 style="margin-top:28px">What that means for a bank of 1,000</h3><div id="pot" style="margin-top:10px"></div></section>
+<div class="side">
+<section class="card" aria-labelledby="h-read"><h2 class="h3" id="h-read">How to read it</h2>
 <ul><li>One unit is staked on every bet the rule would have made, in date order.</li>
+<li>The return is per bet, on the money staked. It is not a yearly figure. A bet settles in about two hours, so the same bank is staked again and again, which is why a 13% return per bet becomes a much larger return on the bank over a year.</li>
 <li>The gap between the two lines is what the out-of-line price is worth. The picks alone do not make money.</li>
 <li>The rule and its settings come from a study published in 2017 using data up to 2015. Every match here was played after that, so the rule could not have been fitted to it.</li>
 <li id="basel"></li>
 <li id="yieldnote"></li>
-<li>The return is on money staked, per bet. A bet settles in about two hours, so the same pot is used again and again. That is why a 13% return per bet can be a much larger return on the pot over a year.</li>
-<li>The ceiling is capacity, not the edge. The rule fires a few dozen times a season, and bookmakers cut the stakes of accounts that win this way.</li></ul></div></div></section>
-
-<section aria-labelledby="h-rec"><h2 id="h-rec">The system's record</h2>
-<p class="sub">One shared record for everyone using Offside. It is not a personal account. It shows what would have happened if every result Offside confirmed since switch-on had been backed once, at the price recorded, with 2% of a bank of 1,000 on each. No real money is involved. The proof of each price is its screenshot and saved page, captured at that moment, with Context.dev's request id.</p>
-<p class="sub"><button type="button" class="mini" id="notif" style="margin:0">Turn on alerts in this browser</button> <span class="small" id="notifmsg"></span>
-<button type="button" class="mini" id="settle" style="margin:0 0 0 8px">Check results now</button> <span class="small" id="settlemsg"></span></p>
-<div class="pot" id="paper"></div>
-<p class="sub" id="recsub"></p><div class="scroll" id="record"></div></section>
-
-<section class="grid"><div><h2>How it works</h2><ol>
+<li>The ceiling is capacity, not the edge. The rule fires a few dozen times a season, and bookmakers cut the stakes of accounts that win this way.</li></ul></section>
+<section class="card"><h2 class="h3">How it works</h2><ol>
 <li>Context.dev finds upcoming matches from league pages, renders each match's odds page as a UK visitor, and its parse rules return every bookmaker's price as structured data.</li>
 <li>The average price across all bookmakers is taken as the fair view of the match.</li>
 <li>A bookmaker's price is flagged when it pays more than that view allows, even after a safety cushion of 3 to 5 points.</li>
 <li>If the price is still there a minute later, it is added to the system's record with a screenshot and a saved copy of the page as proof. Each result is added once per match.</li>
-<li>Context.dev then searches for the bookmaker's own page for that match and looks for the same price there, as a second, independent source.</li>
+<li>Context.dev then searches for the bookmaker's own page for that match and reads the price there, as a second, independent source.</li>
 <li>Context.dev also searches for team news that might explain why that bookmaker is out of line.</li>
-<li>After the match, the final score is looked up and the entry is marked won or lost.</li></ol></div>
-<div><h2>Limits</h2><ul>
-<li>In the tested leagues the medium rule fires once or twice a week. This is a small edge.</li>
+<li>After the match, the final score is looked up and the entry is marked won or lost.</li></ol></section>
+<section class="card"><h2 class="h3">Limits</h2><ul>
+<li>In the tested leagues the medium rule fires once or twice a week. The edge per bet is large, the number of bets is small.</li>
 <li>Bookmakers restrict accounts that bet this way, and can cancel a bet placed at a mistaken price.</li>
 <li>The test covers 18 European leagues. Anything else is marked as outside the tested leagues.</li>
-<li>Offside finds prices. It does not place bets, and betting can lose money.</li></ul></div></section>
+<li>Live prices come from one odds comparison site. A flagged price is then looked for on the bookmaker's own site, which does not always answer.</li>
+<li>Offside finds prices. It does not place bets, and betting can lose money.</li></ul></section>
+</div>
+</div>
 <footer>Offside version VERSION_HERE. Fixtures, odds pages, price extraction, screenshots and team news: Context.dev.
 Historical results and odds: football-data.co.uk. The rule follows Kaunitz, Zhong and Kreiner (2017).</footer></main>
 <script>
@@ -1946,38 +2085,81 @@ function checked(v, there){ return v==="seen"? "<span class='tag ok'>same price 
   (v==="no link"||v==="no site")? "<span class='tag'>bookmaker's own site not checked</span>" : ""; }
 
 function renderStatus(){
-  const nL=S.leagues.length, nP=S.pages.length, bad=S.leagues.concat(S.pages).filter(x=>x.source&&x.source.error&&x.source.error!=="match has started");
-  let h="<span class='dot"+(S.last_read?"":" off")+"'></span>";
-  h+= S.last_read? "<b>"+plural(nP+ (nL? S.matches.length:0),"match")+"</b> watched"+
-      (S.matches.length<nP? " ("+S.matches.length+" of "+nP+" read so far)":"")+"<br>Prices last read at <b>"+esc(clock(S.last_read))+"</b>. Every "+(Math.round(S.interval/6)/10)+" min in a match's last 3 hours, and again within a minute when a price is out of line"+(S.in_play_mode?"<br>In-play reading is on":"") : "First read in progress";
-  if(S.quota) h+="<br>Odds data credits left this month: <b>"+esc(S.quota.remaining)+"</b>";
-  if(S.backlog) h+="<br>"+plural(S.backlog,"page")+" queued for the next pass";
-  if(bad.length) h+="<br>"+plural(bad.length,"source")+" could not be read";
-  if(!S.has_ctx_key) h+="<br>No Context.dev key set: page checks and news are off";
+  const bad=S.leagues.concat(S.pages).filter(x=>x.source&&x.source.error&&x.source.error!=="match has started");
+  const upcoming=S.pages.filter(w=>!w.kickoff||w.kickoff>S.now).length + (S.leagues.length? S.matches.filter(m=>String(m.id).indexOf("api:")===0).length : 0);
+  let h="";
+  if(S.last_read) h+="<span class='pill'><span class='dot'></span><b>Live</b></span><span class='pill'><b>"+upcoming+"</b> "+(upcoming===1?"match":"matches")+" watched</span>"+
+    "<span class='pill'>last read <b>"+esc(clock(S.last_read))+"</b></span>";
+  else h+="<span class='pill'><span class='dot off'></span>First read in progress</span>";
+  if(S.backlog) h+="<span class='pill'><b>"+S.backlog+"</b> queued</span>";
+  if(bad.length) h+="<span class='pill warn'>"+plural(bad.length,"page")+" could not be read</span>";
+  if(!S.has_ctx_key) h+="<span class='pill warn'>No Context.dev key set</span>";
+  if(S.in_play_mode) h+="<span class='pill'>in-play reading on</span>";
   $("status").innerHTML=h;
+}
+function who(e){ return e.outcome==="home"? esc(e.home)+" to win" : e.outcome==="away"? esc(e.away)+" to win" : "The draw"; }
+function strip(e, quiet){
+  const hot=quiet? "var(--ink)" : "var(--card)";
+  // every other bookmaker's price for this result as a dot, with this bookmaker's price far from them
+  const f=(e.field||[]).filter(x=>x[1]>1 && x[0]!==e.book); if(f.length<3) return "";
+  const W=680,H=128,L=14,R=14,y=62, vals=f.map(x=>x[1]).concat([e.price,e.average,e.needed]);
+  let a=Math.min(...vals), b=Math.max(...vals); const pad=(b-a)*0.07||0.02; a-=pad; b+=pad;
+  const X=v=>L+(v-a)/(b-a)*(W-L-R), ax=X(e.average), nx=X(e.needed), px=X(e.price);
+  let g="<rect x='"+nx.toFixed(1)+"' y='"+(y-40)+"' width='"+(W-R-nx).toFixed(1)+"' height='80' rx='10' fill='var(--card)' opacity='.08'/>"+
+    "<line x1='"+L+"' x2='"+(W-R)+"' y1='"+y+"' y2='"+y+"' stroke='var(--line)' stroke-width='2' stroke-linecap='round'/>";
+  const cols={};
+  for(const x of f){ const cx=Math.round(X(x[1])/3)*3; cols[cx]=(cols[cx]||0)+1; }
+  for(const cx in cols){ const n=cols[cx], step=n>9? 80/(n-1) : 10;      // bookmakers on the same price stack up, centred on the line
+    for(let i=0;i<n;i++) g+="<circle cx='"+cx+"' cy='"+(y+(i-(n-1)/2)*step).toFixed(1)+"' r='4.5' fill='var(--muted)' opacity='.75'/>"; }
+  g+="<line x1='"+ax.toFixed(1)+"' x2='"+ax.toFixed(1)+"' y1='"+(y-44)+"' y2='"+(y+46)+"' stroke='var(--chart2)' stroke-width='2'/>"+
+    "<text x='"+(ax<180? ax+8 : ax-8).toFixed(1)+"' y='"+(H-4)+"' text-anchor='"+(ax<180?"start":"end")+"' font-size='13' fill='var(--chart2)'>the rest average "+e.average.toFixed(2)+"</text>"+
+    "<line x1='"+nx.toFixed(1)+"' x2='"+nx.toFixed(1)+"' y1='"+(y-46)+"' y2='"+(y+44)+"' stroke='var(--card)' stroke-width='1.5' stroke-dasharray='4 4'/>"+
+    "<text x='"+(nx>W-190? nx-8 : nx+8).toFixed(1)+"' y='13' text-anchor='"+(nx>W-190?"end":"start")+"' font-size='13' fill='var(--card)'>out of line above "+e.needed.toFixed(2)+"</text>"+
+    "<circle cx='"+px.toFixed(1)+"' cy='"+y+"' r='"+(quiet?7:9)+"' fill='"+hot+"'/>"+
+    "<text x='"+px.toFixed(1)+"' y='"+(y-17)+"' text-anchor='"+(px>W-80?"end":(px<80?"start":"middle"))+"' font-size='14' font-weight='700' fill='"+hot+"'>"+esc(e.book)+" "+e.price.toFixed(2)+"</text>";
+  return "<svg class='strip' viewBox='0 0 "+W+" "+H+"' role='img' aria-label='Every bookmaker price for this result, with this one far from the rest'>"+g+"</svg>";
 }
 function renderLive(){
   const L=S.live;
-  if(!S.leagues.length && !S.pages.length){ $("live").innerHTML="<div class='setup'><div class='d' style='font-size:1.45rem;font-weight:600'>Nothing is being watched yet.</div>"+
-    "<p>Stop the app, find matches, then start it again:</p><p><code>python app.py discover --soon</code> finds matches kicking off in the next day and an odds page for each.<br>"+
-    "<code>python app.py serve</code> starts Offside. You can also paste an odds page address into the box below.</p></div>"; return; }
-  if(!L.length){ $("live").innerHTML="<div class='quiet'><div class='ghost' aria-hidden='true'></div><div><div class='big'>No price is out of line right now.</div>"+
-    "<p>That is normal. In the tested leagues the medium rule fires once or twice a week. The table below shows how close each match is.</p></div></div>"; return; }
-  let h="<table><thead><tr><th>Kick-off</th><th>Match</th><th>Result to back</th><th>Bookmaker</th><th>Price</th><th>Everyone else</th><th>How far out of line</th><th>Status</th></tr></thead><tbody>";
-  for(const e of L){ const k=e.mid+"|"+e.book+"|"+e.outcome, fresh=!first&&!seen.has(k); seen.add(k);
+  if(!S.leagues.length && !S.pages.length){ $("live").innerHTML="<div class='quiet'><div><div class='big'>Nothing is being watched yet.</div>"+
+    "<p>Stop the app, find matches, then start it again: <code>python app.py hub --deep</code> finds the coming matches and their odds pages, and <code>python app.py serve</code> starts Offside.</p></div></div>"; return; }
+  if(!L.length){ const c=S.closest;
+    $("live").innerHTML="<div class='quiet'><div class='ghost' aria-hidden='true'></div><div><div class='big'>No price is out of line right now.</div>"+
+    "<p>That is normal. In the tested leagues the medium rule fires once or twice a week, usually in the last minutes before kick-off.</p></div></div>"+
+    (c? "<article class='flagrow'><div class='fl-top'><div><div class='fl-match'>Closest right now: "+matchName(c)+scope(c)+"</div>"+
+      "<div class='fl-what' style='font-size:1.3rem'>"+who(c)+" at "+esc(c.book)+"</div>"+
+      "<div class='small' style='margin-top:4px'>Kick-off "+esc(until(c.kickoff,S.now))+", "+esc(day(c.kickoff))+"</div></div>"+
+      "<div class='fl-price'><div class='num' style='font-size:2rem;line-height:1.1'>"+c.price.toFixed(2)+"</div><div class='small'>would need to be above "+c.needed.toFixed(2)+"</div></div></div>"+
+      strip(c, true)+"<div class='small' style='margin-top:6px'>Each dot is one bookmaker's price for this result. A price inside the shaded band would be out of line.</div></article>" : ""); return; }
+  let h="";
+  const order=L.slice().sort((x,y)=>((y.status==="confirmed")-(x.status==="confirmed")) || (y.price/y.average-x.price/x.average));
+  const rest=order.slice(3);
+  for(const e of order.slice(0,3)){ const k=e.mid+"|"+e.book+"|"+e.outcome, fresh=!first&&!seen.has(k); seen.add(k);
     const ev=S.evidence&&S.evidence.settings&&S.evidence.settings[String(e.points)];
-    h+="<tr"+(fresh?" class='fresh'":"")+"><td class='when'><span class='num'>"+esc(until(e.kickoff,S.now))+"</span><div class='small'>"+esc(day(e.kickoff))+"</div></td>"+
-    "<td class='m'><span class='match'>"+matchName(e)+"</span>"+scope(e)+
-    (e.book_link? "<div style='margin-top:4px'><a class='go' href='"+esc(e.book_link)+"' target='_blank' rel='noopener'>Bet at "+esc(e.book)+"</a></div>":"")+
-    "<div class='small'>"+(e.url? "<a href='"+esc(e.url)+"' target='_blank' rel='noopener'>"+(e.book_link?"all bookmakers' live prices":"open the live prices")+"</a>" : esc(e.league_title))+"</div></td><td>"+names[e.outcome]+"</td><td class='nw'>"+esc(e.book)+"</td>"+
-    "<td><span class='yc'>"+e.price.toFixed(2)+"</span></td>"+
-    "<td><span class='num'>"+e.average.toFixed(2)+"</span><div class='small'>average. Rule needs above "+e.needed.toFixed(2)+"</div></td>"+
-    "<td><span class='num pos'>+"+(100*(e.price/e.average-1)).toFixed(0)+"%</span> <span class='small nw'>above the average</span>"+
-    "<div class='small'>passes the minus "+e.points+" setting"+(ev? " ("+(ev.roi>=0?"+":"")+(100*ev.roi).toFixed(0)+"% in the test)":"")+"</div></td>"+
-    "<td class='st'>"+(e.status==="confirmed"?"<span class='tag ok'>confirmed</span>":"<span class='tag'>checking again in about a minute</span>")+
-    (e.verify?"<div style='margin-top:5px'>"+checked(e.verify, e.book_price)+"</div>":"")+
-    (e.news?"<div class='small' style='margin-top:5px'>"+esc(e.news)+"</div>":"")+"</td></tr>"; }
-  $("live").innerHTML=h+"</tbody></table>"; first=false;
+    h+="<article class='flagrow"+(fresh?" fresh":"")+"'><div class='fl-top'><div><div class='fl-match'>"+matchName(e)+scope(e)+"</div>"+
+    "<div class='fl-what'>"+who(e)+" at "+esc(e.book)+"</div>"+
+    "<div class='small' style='margin-top:4px'>Kick-off "+esc(until(e.kickoff,S.now))+", "+esc(day(e.kickoff))+"</div></div>"+
+    "<div class='fl-price'><span class='yc'>"+e.price.toFixed(2)+"</span><div class='small pos' style='font-weight:700'>+"+(100*(e.price/e.average-1)).toFixed(0)+"% above the rest</div></div></div>"+
+    strip(e)+
+    "<div class='fl-foot'>"+(e.book_link? "<a class='go' href='"+esc(e.book_link)+"' target='_blank' rel='noopener'>Bet at "+esc(e.book)+"</a>":"")+
+    (e.url? "<a class='lnk' href='"+esc(e.url)+"' target='_blank' rel='noopener'>"+(e.book_link?"all bookmakers' live prices":"open the live prices")+"</a>" : "")+
+    (e.status==="confirmed"?"<span class='tag ok'>confirmed</span>":"<span class='tag'>checking again in about a minute</span>")+
+    (e.verify? checked(e.verify, e.book_price):"")+"</div>"+
+    "<div class='small' style='margin-top:10px'>The rest average "+e.average.toFixed(2)+" and the rule needs above "+e.needed.toFixed(2)+". Passes the minus "+e.points+" setting"+
+    (ev? ", which returned "+(ev.roi>=0?"+":"")+(100*ev.roi).toFixed(0)+"% a bet in the test":"")+".</div>"+
+    (e.news?"<div class='small news'>"+esc(e.news)+"</div>":"")+"</article>"; }
+  if(rest.length){
+    h+="<h3 style='margin:24px 0 10px'>"+rest.length+" more out of line</h3><div class='scroll'><table style='min-width:640px'><thead><tr><th>Match</th><th>Result and bookmaker</th><th>Price</th><th>The rest</th><th>Status</th></tr></thead><tbody>";
+    for(const e of rest){ const k=e.mid+"|"+e.book+"|"+e.outcome; seen.add(k);
+      h+="<tr><td class='m'><span class='match'>"+matchName(e)+"</span>"+scope(e)+"<div class='small'>kick-off "+esc(until(e.kickoff,S.now))+"</div></td>"+
+      "<td>"+who(e)+" at "+esc(e.book)+(e.book_link? "<div style='margin-top:6px'><a class='go' href='"+esc(e.book_link)+"' target='_blank' rel='noopener'>Bet at "+esc(e.book)+"</a></div>" :
+        (e.url? "<div class='small'><a href='"+esc(e.url)+"' target='_blank' rel='noopener'>open the live prices</a></div>":""))+"</td>"+
+      "<td><span class='yc'>"+e.price.toFixed(2)+"</span></td>"+
+      "<td><span class='num'>"+e.average.toFixed(2)+"</span><div class='small pos'>+"+(100*(e.price/e.average-1)).toFixed(0)+"% above</div></td>"+
+      "<td class='st'>"+(e.status==="confirmed"?"<span class='tag ok'>confirmed</span>":"<span class='tag'>checking again in about a minute</span>")+
+      (e.verify? "<div style='margin-top:5px'>"+checked(e.verify, e.book_price)+"</div>":"")+"</td></tr>"; }
+    h+="</tbody></table></div>"; }
+  $("live").innerHTML=h; first=false;
 }
 function renderAll(){
   const M=S.matches, extra=waitingRows();
@@ -2062,21 +2244,22 @@ function renderSeen(){
 }
 function renderFeed(){
   const F=S.feed||[];
-  if(!F.length){ $("feed").innerHTML="<span class='small'>Reads appear here as they happen.</span>"; return; }
-  $("feed").innerHTML=F.map(f=>"<div><b>"+esc(clock(f.t))+"</b>&nbsp; "+esc(f.match)+": "+
-    (f.ok? "<span class='ok'>"+f.books+" bookmakers</span>" : "<span class='bad'>read failed</span>")+" in "+f.secs.toFixed(1)+" s"+
-    (f.ok&&f.fresh? ", fresh":"")+(f.method? ", via "+esc(f.method):"")+(f.request_id? " <span class='small'>request "+esc(f.request_id.slice(0,8))+"</span>":"")+"</div>").join("");
+  if(!F.length){ $("feed").innerHTML="<p class='small' style='margin:8px 0'>Reads appear here as they happen.</p>"; return; }
+  $("feed").innerHTML=F.map(f=>"<div class='fd"+(f.ok?"":" bad")+"'><i></i><div><b>"+esc(f.match)+"</b><span class='t'>"+esc(clock(f.t))+"</span>"+
+    "<div class='small'>"+(f.ok? f.books+" bookmakers in "+f.secs.toFixed(1)+" s"+(f.fresh?", fresh from the site":"")+(f.method? ", via "+esc(f.method):"") : "read failed after "+f.secs.toFixed(1)+" s")+
+    (f.request_id? ", request "+esc(f.request_id.slice(0,8)):"")+"</div></div></div>").join("");
 }
 function renderPot(){
   const p=S.pot; if(!p){ $("paper").innerHTML=""; return; }
   const d=p.now-p.start, money=x=>x.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  const on=S.alerts&&(S.alerts.ntfy||S.alerts.webhook||S.alerts.sms);
   $("paper").innerHTML="<div><b>"+money(p.now)+"</b><span>the bank now, from a start of "+money(p.start)+"</span></div>"+
-    "<div><b>"+(d>=0?"+":"")+money(d)+"</b><span>profit or loss on finished matches</span></div>"+
+    "<div><b class='"+(d>0?"pos":d<0?"neg":"")+"'>"+(d>=0?"+":"")+money(d)+"</b><span>profit or loss on finished matches</span></div>"+
     "<div><b>"+p.open_bets+"</b><span>still to finish, "+money(p.open)+" staked</span></div>"+
     "<div><b>"+p.stake_pct+"%</b><span>of the bank on every confirmed price</span></div>"+
-    "<div><b>"+((S.alerts&&(S.alerts.ntfy||S.alerts.webhook||S.alerts.sms))?"On":"Off")+"</b><span>"+((S.alerts&&S.alerts.sms)? "text messages to the phone ending "+esc(S.alerts.sms) :
+    "<div><b"+(on?" class='pos'":"")+">"+(on?"On":"Off")+"</b><span>"+((S.alerts&&S.alerts.sms)? "alerts by text message to the phone ending "+esc(S.alerts.sms) :
       (S.alerts&&S.alerts.ntfy)? "phone alerts, topic "+esc(S.alerts.ntfy) :
-      (S.alerts&&S.alerts.webhook)? "alerts to a chat channel" : "phone alerts. Start with --ntfy and a topic name")+"</span></div>";
+      (S.alerts&&S.alerts.webhook)? "alerts to a chat channel, the moment a price is out of line" : "alerts to a phone or chat channel")+"</span></div>";
 }
 async function readNow(id, btn){ btn.disabled=true; btn.textContent="Reading through Context.dev…";
   try{ await fetch("/api/read",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id})}); }catch(e){}
@@ -2087,13 +2270,13 @@ function readNote(m){ const n=(S.read_note||{})[m.id]; if(!n) return "";
   return "<div class='small' style='color:var(--loss);font-weight:600'>Read failed: "+esc(n.why||"")+"</div>"; }
 function ago(t){ const d=Math.max(0,Math.round(S.now-t)); return d<90? d+" s ago" : Math.round(d/60)+" min ago"; }
 function renderWork(){
-  const s=S.stats||{}; if(!s.pages){ $("work").innerHTML=""; $("work").style.display="none"; return; }
-  $("work").style.display="";
+  const s=S.stats||{}; if(!s.pages){ $("workcard").style.display="none"; return; }
+  $("workcard").style.display="";
   const cell=(n,l)=>"<div><b>"+Number(n||0).toLocaleString()+"</b><span>"+l+"</span></div>";
   $("work").innerHTML=cell(s.pages,"odds pages read through Context.dev")+cell(s.prices,"bookmaker prices read from them")+
-    cell((S.seen||[]).length,"prices seen out of line")+cell(S.summary.recorded,"prices recorded")+cell(s.screenshots,"proof screenshots")+cell(s.news,"team-news searches")+
+    cell((S.seen||[]).length,"prices seen out of line")+cell(S.summary.recorded,"confirmed and recorded")+cell(s.screenshots,"proof screenshots")+cell(s.news,"team-news searches")+
     (s.credits!=null? cell(s.credits,"Context.dev credits left"):"")+
-    "<div><b>"+esc(day(s.since))+"</b><span>running since</span></div>";
+    "<div style='grid-column:span 2'><b style='font-size:1.3rem;white-space:nowrap'>"+esc(day(s.since))+"</b><span>running since</span></div>";
 }
 function renderEvidence(){
   const E=S.evidence;
@@ -2108,18 +2291,20 @@ function renderEvidence(){
   $("switch").innerHTML=Object.keys(E.settings).map(k=>"<button type='button' aria-pressed='"+(k===setting)+"' data-k='"+k+"'>"+labels[k]+"</button>").join("");
   for(const b of $("switch").querySelectorAll("button")) b.onclick=()=>{setting=b.dataset.k; renderEvidence();};
   const s=E.settings[setting], pc=x=>x==null?"n/a":(x>=0?"+":"")+(100*x).toFixed(1)+"%", sp=E.split.slice(0,2)+"/"+E.split.slice(2);
-  $("figs").innerHTML="<div><b>"+pc(s.roi)+"</b><span>return per unit staked, whole period</span></div>"+
-    "<div><b>"+pc(s.older_roi)+"</b><span>seasons before "+esc(sp)+" ("+s.older_bets+" bets)</span></div>"+
-    "<div><b>"+pc(s.newer_roi)+"</b><span>seasons from "+esc(sp)+" ("+s.newer_bets+" bets)</span></div>"+
-    "<div><b>"+s.bets.toLocaleString()+"</b><span>bets, about "+(s.per_week>=1? s.per_week.toFixed(1)+" a week" : "one every "+(1/s.per_week).toFixed(1)+" weeks")+"</span></div>";
-  $("tnote").textContent = s.t==null? "" : "t statistic "+s.t.toFixed(1)+". Above 2 means the result is unlikely to be luck. Won "+(100*s.win).toFixed(0)+"% of bets at average odds of "+s.avg_odds.toFixed(2)+".";
+  const bank=(s.pot||[])[0], perYear=s.years? s.bets/s.years : null;
+  $("figs").innerHTML="<div><b class='pos'>"+pc(s.roi)+"</b><span>return on every bet, on the money staked. It is not a yearly figure</span></div>"+
+    (s.units!=null? "<div><b>"+(s.units>=0?"+":"")+Math.round(s.units)+"</b><span>units of profit in total over "+s.years+" years, staking 1 unit a bet</span></div>":"")+
+    (bank? "<div><b>"+(bank.per_year_pct>=0?"+":"")+Math.round(bank.per_year_pct)+"%</b><span>a year on average, on a bank of 1,000 staking "+bank.stake+" a bet</span></div>":"")+
+    "<div><b>"+s.bets.toLocaleString()+"</b><span>bets"+(perYear? ", about "+Math.round(perYear)+" a year":"")+"</span></div>";
+  $("tnote").textContent = "Seasons before "+sp+" returned "+pc(s.older_roi)+" a bet over "+s.older_bets+" bets. Seasons from "+sp+" returned "+pc(s.newer_roi)+" over "+s.newer_bets+" bets."+
+    (s.t==null? "" : " The t statistic is "+s.t.toFixed(1)+", and above 2 means the result is unlikely to be luck. It won "+(100*s.win).toFixed(0)+"% of bets at average odds of "+s.avg_odds.toFixed(2)+".");
   drawChart(s.series, E.split_month, sp);
-  $("yieldnote").textContent="This setting returned "+pc(s.roi)+" per bet. Professional bettors typically aim for 2% to 5%.";
+  $("yieldnote").textContent="This setting returned "+pc(s.roi)+" per bet. A return of 2% to 5% per bet is usually thought of as a good long-run result for a professional.";
   if(!s.seasons){ $("seasons").innerHTML=""; $("pot").innerHTML=""; $("seasnote").textContent="Run: python app.py evidence, to add the season table."; return; }
-  $("seasnote").textContent=s.winning_seasons+" of "+s.n_seasons+" seasons made money. Bars show profit in units, one unit staked per bet. A single season has few bets, so it is noisy.";
+  $("seasnote").textContent=s.winning_seasons+" of "+s.n_seasons+" seasons made money. Bars show each season's profit in units, one unit staked per bet. A single season has few bets, so it is noisy.";
   drawSeasons(s.seasons);
-  let h="<div class='scroll'><table style='min-width:0'><thead><tr><th>Stake per bet from a 1,000 pot</th><th>Profit over "+s.years+" years</th><th>Average a year on the pot</th><th>Worst season</th></tr></thead><tbody>";
-  for(const r of s.pot) h+="<tr><td><span class='num'>"+r.stake+"</span> <span class='small'>("+r.stake_pct+"% of the pot)</span></td><td><span class='num pos'>"+(r.total>=0?"+":"")+r.total.toLocaleString()+"</span></td>"+
+  let h="<div class='scroll'><table style='min-width:0'><thead><tr><th>Stake per bet</th><th>Profit over "+s.years+" years</th><th>Average a year on the bank</th><th>Worst season</th></tr></thead><tbody>";
+  for(const r of s.pot) h+="<tr><td><span class='num'>"+r.stake+"</span> <span class='small'>("+r.stake_pct+"% of the bank)</span></td><td><span class='num pos'>"+(r.total>=0?"+":"")+r.total.toLocaleString()+"</span></td>"+
     "<td><span class='num pos'>"+(r.per_year_pct>=0?"+":"")+r.per_year_pct+"%</span></td><td><span class='num neg'>"+r.worst_season.toLocaleString()+"</span></td></tr>";
   $("pot").innerHTML=h+"</tbody></table></div><p class='small' style='margin:8px 0 0'>Flat stakes, no compounding, from the test. It assumes the recorded price was available every time and the account was never limited.</p>";
 }
@@ -2130,7 +2315,7 @@ function drawSeasons(rows){
   let g="<line x1='"+L+"' x2='"+(W-R)+"' y1='"+Y(0)+"' y2='"+Y(0)+"' stroke='var(--muted)' stroke-width='1.2'/>";
   rows.forEach((r,i)=>{ const x=L+i*bw+bw*0.16, w=bw*0.68, y=r.units>=0?Y(r.units):Y(0), h=Math.max(1,Math.abs(Y(r.units)-Y(0)));
     g+="<rect x='"+x.toFixed(1)+"' y='"+y.toFixed(1)+"' width='"+w.toFixed(1)+"' height='"+h.toFixed(1)+"' rx='2' fill='"+(r.units>=0?"var(--win)":"var(--loss)")+"'/>"+
-       "<text x='"+(x+w/2).toFixed(1)+"' y='"+(r.units>=0? y-5 : y+h+13).toFixed(1)+"' text-anchor='middle' font-size='12' fill='var(--ink)'>"+(r.units>0?"+":"")+r.units.toFixed(0)+"</text>"+
+       "<text x='"+(x+w/2).toFixed(1)+"' y='"+(r.units>=0? y-5 : y+h+13).toFixed(1)+"' text-anchor='middle' font-size='12' fill='var(--ink)'>"+(Math.round(r.units)>0?"+":"")+Math.round(r.units)+"</text>"+
        "<text x='"+(x+w/2).toFixed(1)+"' y='"+(H-24)+"' text-anchor='middle' font-size='12' fill='var(--muted)'>"+esc(r.season)+"</text>"+
        "<text x='"+(x+w/2).toFixed(1)+"' y='"+(H-9)+"' text-anchor='middle' font-size='11' fill='var(--muted)'>"+r.bets+" bets</text>"; });
   $("seasons").innerHTML="<svg viewBox='0 0 "+W+" "+H+"' role='img' aria-label='Profit in units by season'>"+g+"</svg>";
@@ -2180,7 +2365,7 @@ $("settle").addEventListener("click", async ()=>{ $("settlemsg").textContent="Lo
 const PAGE_VERSION="VERSION_HERE";
 async function tick(){ try{ const r=await fetch("/api/state"); S=await r.json(); renderStatus(); renderLive(); renderAll(); if(S.version && S.version!==PAGE_VERSION){ location.reload(); return; }
   renderRecord(); renderPot(); renderFeed(); renderSeen(); renderWork(); renderEvidence(); browserAlerts(); }
-  catch(e){ $("status").innerHTML="<span class='dot off'></span>The scanner is not answering. Is app.py still running?"; } }
+  catch(e){ $("status").innerHTML="<span class='pill warn'><span class='dot off'></span>The scanner is not answering. Is app.py still running?</span>"; } }
 
 tick(); setInterval(tick, 5000);
 </script></body></html>
@@ -2378,6 +2563,9 @@ def _selftest():
     e10.add_watch("https://odds.example/m10"); e10.cycle(); clock[0] += 60; e10.cycle()
     s10 = e10.state()["seen"][0]
     C.append(("the earlier log carries what the bookmaker's own site showed", s10.get("verify") == "seen" and s10.get("book_link", "").endswith("/event/123") and s10["recorded"]))
+    fld_ = e10.state()["live"][0]["field"]
+    C.append(("the board names the match closest to the line, with every bookmaker's price", (lambda c: c is None or (c["field"] and c["needed"] > 1 and c["book"]))(e10.state()["closest"])))
+    C.append(("a live row carries every bookmaker's price for that result", len(fld_) >= 5 and fld_ == sorted(fld_, key=lambda x: x[1]) and any(b_ == "SlowBook" for b_, _ in fld_)))
     C.append(("a live row carries the bookmaker's own page once it is found", e10.state()["live"][0]["book_link"] == "https://slowbook.example/event/123"))
     C.append(("the first alert is followed by one linking to the bookmaker's own page, and the check is not repeated",
               len(al9) == 3 and al9[0][0].startswith("Out of line") and al9[1][0].startswith("Bet at") and al9[1][2] == "https://slowbook.example/event/123" and "same price" in al9[1][1]
@@ -2629,6 +2817,9 @@ def _selftest():
                    "y": 0 if won else 2, "avg": [2.0, 3.6, 3.8], "max": [2.3, 3.7, 3.9], "named": [2.3, 3.7, 3.9], "pin": None, "b365": None, "n_books": 5})
     ev = build_evidence(ms); s4 = ev["settings"]["4"]
     C.append(("chart data: running totals end at the right profit", abs(s4["series"][-1][1] - s4["roi"] * s4["bets"]) < 0.05 and s4["series"][-1][3] == s4["bets"]))
+    blk_ = readme_block(ev)
+    C.append(("the README section shows the return per bet, in total, per year and on a bank", "Return on every bet" in blk_ and "not a yearly figure" in blk_
+              and "average return a year" in blk_ and "Total profit at £100 a bet" in blk_ and "Season by season" in blk_ and "filled in by" not in blk_))
     C.append(("the season table and the pot figures add up", sum(x["bets"] for x in s4["seasons"]) == s4["bets"] and abs(sum(x["units"] for x in s4["seasons"]) - s4["units"]) < 0.3
               and s4["pot"][0]["stake"] == 20 and s4["pot"][1]["total"] == round(s4["roi"] * s4["bets"] * 50) and s4["n_seasons"] == 2))
     C.append(("chart data: the outlier line beats the average-price line", s4["series"][-1][1] > s4["series"][-1][2] and s4["older_bets"] + s4["newer_bets"] == s4["bets"] and ev["split_month"]))
@@ -2748,7 +2939,12 @@ def main():
         ev = build_evidence(matches); save("evidence.json", ev)
         for k, s in ev["settings"].items():
             print("  minus %s points: %d bets, return %+.1f%%, t=%.2f" % (k, s["bets"], 100 * s["roi"], s["t"] or 0))
-        print("saved %s" % os.path.join(DATA, "evidence.json")); return
+        print("saved %s" % os.path.join(DATA, "evidence.json"))
+        try:
+            if refresh_readme(ev): print("README.md: the test results section was rewritten from this data")
+        except Exception as e:
+            print("README.md was not updated: %s" % str(e)[:120])
+        return
     okey, ckey = os.environ.get("ODDS_API_KEY"), os.environ.get("CONTEXT_DEV_API_KEY")
     if a.cmd == "hub":
         if not ckey: sys.exit("Set CONTEXT_DEV_API_KEY first:  set CONTEXT_DEV_API_KEY=ctxt_secret_...")

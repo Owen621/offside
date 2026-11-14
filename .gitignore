@@ -12,3 +12,4 @@ __pycache__/
 # never commit keys
 .env
 *.key
+offside_data_backup/

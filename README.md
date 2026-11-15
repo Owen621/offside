@@ -4,6 +4,8 @@ Finds bookmaker prices that are out of line with everyone else's, on the live we
 
 Built at Junction 2026 for the Context.dev challenge.
 
+https://owen621.github.io/offside/
+
 ## What it does
 
 Bookmakers as a group price a football match very accurately. Any single bookmaker is sometimes out of line: slow to update, running a promotion, or simply wrong. Offside does not predict matches. It reads every bookmaker's price for a match, takes the average as the fair view, and flags the one bookmaker paying clearly more than that.

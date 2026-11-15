@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import odds
 import scan
 
-VERSION = "build 33"          # shown at start-up and at the foot of the dashboard
+VERSION = "build 34"          # shown at start-up and at the foot of the dashboard
 DATA = "offside_data"
 ODDS_API = "https://api.the-odds-api.com/v4"
 EXCHANGE = re.compile(r"betfair_ex|matchbook|smarkets|exchange", re.I)     # exchanges are not bookmaker prices
@@ -2407,6 +2407,7 @@ def refresh_readme(ev, path="README.md"):
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Offside</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2034%2034%22%3E%3Cdefs%3E%3ClinearGradient%20id=%22g%22%20x1=%220%22%20y1=%220%22%20x2=%221%22%20y2=%221%22%3E%3Cstop%20offset=%220%22%20stop-color=%22%2322d3ee%22/%3E%3Cstop%20offset=%22.6%22%20stop-color=%22%23818cf8%22/%3E%3Cstop%20offset=%221%22%20stop-color=%22%23c084fc%22/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width=%2234%22%20height=%2234%22%20rx=%2210%22%20fill=%22url%28%23g%29%22/%3E%3Ccircle%20cx=%228%22%20cy=%2217%22%20r=%222.2%22%20fill=%22%23fff%22%20opacity=%22.8%22/%3E%3Ccircle%20cx=%2213.5%22%20cy=%2217%22%20r=%222.2%22%20fill=%22%23fff%22%20opacity=%22.8%22/%3E%3Cline%20x1=%2219.5%22%20y1=%227%22%20x2=%2219.5%22%20y2=%2227%22%20stroke=%22%23fff%22%20stroke-width=%222%22%20stroke-dasharray=%223%202.6%22%20stroke-linecap=%22round%22/%3E%3Ccircle%20cx=%2226%22%20cy=%2217%22%20r=%223.4%22%20fill=%22%23ffc83d%22/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Sora:wght@500;600;700&display=swap" rel="stylesheet">
 <style>

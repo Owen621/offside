@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import odds
 import scan
 
-VERSION = "build 34"          # shown at start-up and at the foot of the dashboard
+VERSION = "build 35"          # shown at start-up and at the foot of the dashboard
 DATA = "offside_data"
 ODDS_API = "https://api.the-odds-api.com/v4"
 EXCHANGE = re.compile(r"betfair_ex|matchbook|smarkets|exchange", re.I)     # exchanges are not bookmaker prices
@@ -782,17 +782,25 @@ def ctx_search(key, query, n=10):
 
 
 def ctx_screenshot(key, url):
-    """A picture of the page as Context.dev sees it right now: (image bytes, extension) or (None, '')."""
+    """A picture of the page as Context.dev sees it right now: (image bytes, extension) or (None, '').
+    Cookie banners and popups are dismissed by Context.dev (dismissCookies, dismissPopups). A consent box that appears late can
+    survive that, and it sits in the middle of the browser window. So the window is made very tall and only the top of the page,
+    where the prices are, is captured: a box in the middle of a tall window is below the captured area."""
     import base64
-    try:
-        res = scan.http(scan.CTX_SCRAPE, {"url": url, "formats": {"screenshot": True}, "screenshotParams": {"format": "jpeg"},
-                                     "sharedParams": {"waitFor": 2500, "country": "GB", "dismissPopups": True, "viewport": {"width": 1440, "height": 1700}},
-                                     "maxAgeMs": 0}, key, timeout=150)
-        data = (res.get("screenshot") or {}).get("data") or ""
-        m = re.match(r"^data:image/(png|jpeg|webp);base64,(.+)$", data, re.S)
-        return (base64.b64decode(m.group(2)), "jpg" if m.group(1) == "jpeg" else m.group(1)) if m else (None, "")
-    except Exception:
-        return None, ""
+    tall = {"sharedParams": {"waitFor": 2500, "country": "GB", "dismissCookies": True, "dismissPopups": True, "viewport": {"width": 1440, "height": 4000}},
+            "screenshotParams": {"format": "jpeg", "area": {"x": 0, "y": 0, "width": 1440, "height": 1350}}}
+    plain = {"sharedParams": {"waitFor": 2500, "country": "GB", "dismissCookies": True, "dismissPopups": True, "viewport": {"width": 1440, "height": 1700}},
+             "screenshotParams": {"format": "jpeg"}}
+    for opts in (tall, plain):                                       # the plain form is the fallback if the first is refused
+        try:
+            res = scan.http(scan.CTX_SCRAPE, dict({"url": url, "formats": {"screenshot": True}, "maxAgeMs": 0}, **opts), key, timeout=150)
+            data = (res.get("screenshot") or {}).get("data") or ""
+            m = re.match(r"^data:image/(png|jpeg|webp);base64,(.+)$", data, re.S)
+            if m:
+                return base64.b64decode(m.group(2)), "jpg" if m.group(1) == "jpeg" else m.group(1)
+        except Exception:
+            continue
+    return None, ""
 
 
 # --------------------------------------------------------------------------- Context.dev lookups
@@ -3419,6 +3427,19 @@ def _selftest():
                                  http=lambda url, body, timeout=75: {"results": []} if url == CTX_SEARCH else ({"json_content": {}} if url == scan.CTX_ANSWERS else
                                        {"markdown": {"success": True, "data": "England League 1. Barnsley Sheff Wed 3.00 3.70 2.01"}, "json": {"success": True, "data": {"is_this_match": False}}}))
     C.append(("a failed check says why: the page would not open, the match was not on it, or no page was found", lp3_[0] == "not listed"))
+    shots_ = []
+    real_http_ = scan.http
+    def shot_http(url, body, key, timeout=90):
+        shots_.append(body)
+        if len(shots_) == 1: raise urllib.error.HTTPError(url, 400, "no", {}, io.BytesIO(b"{}"))
+        return {"screenshot": {"success": True, "data": "data:image/jpeg;base64,/9j/4AAQ"}}
+    scan.http = shot_http
+    try: img_s, ext_s = ctx_screenshot("k", "https://odds.example/m")
+    finally: scan.http = real_http_
+    C.append(("the proof screenshot uses a tall window and captures only the top of the page, so a consent box in the middle is left out, with a plain capture as the fallback",
+              shots_[0]["sharedParams"]["viewport"]["height"] == 4000 and shots_[0]["screenshotParams"]["area"] == {"x": 0, "y": 0, "width": 1440, "height": 1350}
+              and shots_[0]["sharedParams"]["dismissCookies"] is True and shots_[0]["sharedParams"]["dismissPopups"] is True
+              and "area" not in shots_[1]["screenshotParams"] and ext_s == "jpg" and bool(img_s)))
     bd_ = {"title": "bet365", "colors": [{"hex": "#027B5B", "name": "green"}], "logos": [
         {"url": "https://media.example/wide.svg", "type": "logo", "mode": "light", "resolution": {"width": 600, "height": 120}},
         {"url": "https://media.example/icon.png", "type": "icon", "mode": "has_opaque_background", "resolution": {"width": 256, "height": 256}},
@@ -3742,6 +3763,7 @@ def main():
     p.add_argument("--refresh", action="store_true", help="fetch them all again, not only the missing ones")
     p = sub.add_parser("drop-early", help="take out of the record every entry that was recorded more than a set time before kick-off")
     p.add_argument("--hours", type=float, default=48)
+    sub.add_parser("reshoot", help="retake the proof screenshot of unfinished record entries whose price is still showing on the odds page")
     sub.add_parser("usage", help="print how many Context.dev calls of each kind the app has made, for the demo and the write-up")
     p = sub.add_parser("selids", help="print each bookmaker's own id for the three results of a match, from the odds page's data"); p.add_argument("url")
     p = sub.add_parser("bookpage", help="tell Offside a bookmaker's own page for a league, so links and price checks go there")
@@ -3904,6 +3926,31 @@ def main():
         for r in out_:
             print("  removed: %s v %s, %s %s at %.2f, recorded %.1f days before kick-off" % (r["home"], r["away"], r["book"], r["outcome"], r["price"], (r["kickoff"] - r["t"]) / 86400.0))
         print("\n%d removed, %d left in the record. The removed entries are kept in offside_data\\record_removed.json." % (len(out_), len(rec_) - len(out_)))
+        return
+    if a.cmd == "reshoot":
+        key_ = os.environ.get("CONTEXT_DEV_API_KEY")
+        if not key_: sys.exit("Set CONTEXT_DEV_API_KEY first.")
+        rec_ = load("record.json", []) or []
+        todo_ = [r for r in rec_ if r.get("result") is None and r.get("url") and (not r.get("kickoff") or r["kickoff"] > time.time())]
+        if not todo_: print("Nothing to retake: no unfinished entries with an odds page."); return
+        os.makedirs(os.path.join(DATA, "proofs"), exist_ok=True)
+        n_ok = 0
+        for r in todo_:
+            label = "%s v %s, %s at %.2f" % (r["home"], r["away"], r["book"], r["price"])
+            grid_, _t, why_ = ctx_read_odds(key_, r["url"], light=True)
+            now_ = (grid_ or {}).get(r["book"])
+            now_ = now_[("home", "draw", "away").index(r["outcome"])] if now_ else None
+            if now_ is None or abs(now_ - r["price"]) > 0.011:
+                print("  kept the original: %s  (%s)" % (label, "the page could not be read" if now_ is None else "the price there is now %.2f" % now_)); continue
+            img_, ext_ = ctx_screenshot(key_, r["url"])
+            if not img_:
+                print("  kept the original: %s  (no screenshot came back)" % label); continue
+            name_ = "%s.%s" % (r["id"], ext_)
+            with open(os.path.join(DATA, "proofs", name_), "wb") as f: f.write(img_)
+            r["shot"] = name_; r["shot_t"] = time.time(); n_ok += 1
+            print("  retaken: %s" % label)
+        save("record.json", rec_)
+        print("\n%d of %d screenshots retaken. Restart the dashboard to show them." % (n_ok, len(todo_)))
         return
     if a.cmd == "usage":
         st_ = (load("state.json", {}) or {}).get("stats") or {}
